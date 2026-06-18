@@ -249,6 +249,46 @@ def rumble_hidraw(pid, lead):
         os.close(hf)
 
 
+def gc_rumble_buf(report_id, on, tid):
+    """GameCube combined rumble+LED report (BlueRetro format).
+
+    Simple on/off rumble at byte 2, with an embedded SET_LED command.
+    """
+    b = bytearray(64)
+    b[0] = report_id            # HID report id (0x03), or 0x00 over vendor bulk
+    b[1] = 0x50 | (tid & 0x0f)  # rumble packet header / rolling id
+    b[2] = 0x01 if on else 0x00 # rumble on/off
+    b[5] = 0x09                 # CMD_SET_LED
+    b[6] = 0x91                 # REQ
+    b[7] = 0x00                 # interface = USB
+    b[8] = 0x07                 # SUBCMD_SET_LED
+    b[10] = 0x08
+    b[13] = 0x01                # player 1 LED
+    return bytes(b)
+
+
+def rumble_gc_hidraw(pid):
+    """GameCube rumble as a HID output report (report id 0x03)."""
+    path = find_hidraw(pid)
+    if not path:
+        print("  no hidraw node; skipping")
+        return
+    hf = os.open(path, os.O_RDWR)
+    try:
+        def send(i, stop=False):
+            os.write(hf, gc_rumble_buf(0x03, not stop, i))
+        _drive(send)
+    finally:
+        os.close(hf)
+
+
+def rumble_gc_vendor(fd):
+    """GameCube rumble over the vendor bulk OUT (BLE-style leading 0x00)."""
+    def send(i, stop=False):
+        usb_bulk(fd, EP_OUT, gc_rumble_buf(0x00, not stop, i)[:21], 21, 1000)
+    _drive(send)
+
+
 def rumble_vendor(fd, pid, sub, mode):
     """Command-framed rumble (cmd 0x0a) over the vendor bulk OUT.
 
@@ -418,14 +458,10 @@ def main():
                 # the GC uses the command channel for rumble. Try command-framed
                 # variants first (they don't touch the HID interface).
                 variants = [
-                    ("G1: cmd 0x0a sub 0x02 + HD packet",
-                     lambda: rumble_vendor(fd, pid, 0x02, "hd")),
-                    ("G2: cmd 0x0a sub 0x02 + amplitude byte",
-                     lambda: rumble_vendor(fd, pid, 0x02, "amp")),
-                    ("G3: cmd 0x0a sub 0x00 + HD packet",
-                     lambda: rumble_vendor(fd, pid, 0x00, "hd")),
-                    ("G4: HID output report id + packet",
-                     lambda: rumble_hidraw(pid, b"")),
+                    ("G-HID: BlueRetro combined rumble+LED, HID output report",
+                     lambda: rumble_gc_hidraw(pid)),
+                    ("G-vendor: BlueRetro combined rumble+LED, vendor bulk",
+                     lambda: rumble_gc_vendor(fd)),
                 ]
             else:
                 variants = [
