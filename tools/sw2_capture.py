@@ -249,12 +249,19 @@ def rumble_hidraw(pid, lead):
         os.close(hf)
 
 
-def rumble_vendor_cmd(fd, pid):
-    """Send rumble command-framed (cmd 0x0a) over the vendor bulk OUT."""
+def rumble_vendor(fd, pid, sub, mode):
+    """Command-framed rumble (cmd 0x0a) over the vendor bulk OUT.
+
+    mode 'hd'  -> payload is the HD motor packet (0x50|id + 3 frames)
+    mode 'amp' -> payload is a single amplitude byte (simple motor)
+    """
     def send(i, stop=False):
         amp = 0 if stop else 700
-        mp = motor_packet(pid, amp, amp, i)
-        frame = bytes([0x0a, 0x91, 0x00, 0x02, 0x00, len(mp), 0x00, 0x00]) + mp
+        if mode == "hd":
+            data = motor_packet(pid, amp, amp, i)
+        else:
+            data = bytes([0x00 if stop else 0xff])
+        frame = bytes([0x0a, 0x91, 0x00, sub, 0x00, len(data), 0x00, 0x00]) + data
         usb_bulk(fd, EP_OUT, frame, len(frame), 1000)
     _drive(send)
 
@@ -406,13 +413,25 @@ def main():
         if args.leds:
             led_test(fd)
         if args.rumble:
-            variants = [
-                ("C: HID output report, id + packet", lambda: rumble_hidraw(pid, b"")),
-                ("D: HID output report, id + 0x00 + packet",
-                 lambda: rumble_hidraw(pid, b"\x00")),
-                ("E: vendor bulk, command-framed (cmd 0x0a)",
-                 lambda: rumble_vendor_cmd(fd, pid)),
-            ]
+            if pid == 0x2073:
+                # GameCube: the HID-output path returns ENODEV, and nsogcd notes
+                # the GC uses the command channel for rumble. Try command-framed
+                # variants first (they don't touch the HID interface).
+                variants = [
+                    ("G1: cmd 0x0a sub 0x02 + HD packet",
+                     lambda: rumble_vendor(fd, pid, 0x02, "hd")),
+                    ("G2: cmd 0x0a sub 0x02 + amplitude byte",
+                     lambda: rumble_vendor(fd, pid, 0x02, "amp")),
+                    ("G3: cmd 0x0a sub 0x00 + HD packet",
+                     lambda: rumble_vendor(fd, pid, 0x00, "hd")),
+                    ("G4: HID output report id + packet",
+                     lambda: rumble_hidraw(pid, b"")),
+                ]
+            else:
+                variants = [
+                    ("C: HID output report, id + packet",
+                     lambda: rumble_hidraw(pid, b"")),
+                ]
             for label, fn in variants:
                 print(f"\n=== Variant {label} ===  (feel for ~1.2s)")
                 fn()

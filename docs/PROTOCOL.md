@@ -190,3 +190,9 @@ is not implemented over USB.
 - The pre-IMU bytes ~20..31 (frame counter + inactive feature slots) are only
   partially identified.
 - Joy-Con SL/SR button bits (9/10) are unverified guesses.
+- Charging-grip GL/GR buttons: the grip (`0x2068`) is a pure USB hub (no HID
+  interface of its own), and pressing GL produced no bit change in the Joy-Con
+  reports. Where GL/GR are exposed (a Joy-Con report field only set when grip-
+  attached, or only over Bluetooth) is unknown.
+- GameCube rumble: HID-output write returns ENODEV; trying command-channel
+  framings (`cmd 0x0a`) per nsogcd's "command + rumble" handle.
