@@ -67,6 +67,22 @@
 #define SW2_OFF_TRIGGER_L	13	/* analog left trigger (GameCube) */
 #define SW2_OFF_TRIGGER_R	14	/* analog right trigger (GameCube) */
 
+/*
+ * IMU: one sample per report, six s16 LE values interleaved per axis
+ * (gyro then accel). Confirmed for the Pro Controller (report 0x09) via a
+ * rotation capture; other controllers' offsets are not yet known.
+ */
+#define SW2_OFF_IMU_PROCON	32	/* gX,aX,gY,aY,gZ,aZ at +0,+2,...,+10 */
+#define SW2_IMU_LEN		12
+
+/* Accelerometer resolution: ~4096 LSB per g (rest |a| measured ~4096). */
+#define SW2_IMU_ACCEL_RES_PER_G	4096
+/*
+ * Gyro resolution in LSB per degree/s. Not yet measured for the Switch 2;
+ * reuse the original Switch value as a placeholder until calibrated.
+ */
+#define SW2_IMU_GYRO_RES_PER_DPS	14247
+
 #define SW2_STICK_CENTER	2048	/* 12-bit stick midpoint */
 #define SW2_STICK_MAX		4095
 /* GameCube analog triggers report roughly 0x24..0xf0; remap to 0..255. */
@@ -83,9 +99,11 @@ enum sw2_ctlr_type {
 struct sw2_ctlr {
 	struct hid_device *hdev;
 	struct input_dev *input;
+	struct input_dev *imu_input;
 	struct usb_device *udev;
 	enum sw2_ctlr_type type;
 	u8 input_report_id;
+	u8 imu_offset;		/* report offset of IMU sample, 0 if none */
 	unsigned int ep_out;	/* bulk OUT pipe on the vendor interface */
 	unsigned int ep_in;	/* bulk IN pipe on the vendor interface */
 };
@@ -372,6 +390,29 @@ static void sw2_report_sticks(struct sw2_ctlr *ctlr, const u8 *data)
 	}
 }
 
+static s16 sw2_s16le(const u8 *p)
+{
+	return (s16)(p[0] | (p[1] << 8));
+}
+
+/*
+ * Report the IMU sample. The six s16 values are interleaved per axis as
+ * gyro,accel for X, then Y, then Z, starting at ctlr->imu_offset. Gyro is
+ * reported on ABS_R[XYZ], accel on ABS_[XYZ], on a separate input device.
+ */
+static void sw2_report_imu(struct sw2_ctlr *ctlr, const u8 *data)
+{
+	const u8 *p = data + ctlr->imu_offset;
+
+	input_report_abs(ctlr->imu_input, ABS_RX, sw2_s16le(p + 0));  /* gyro X */
+	input_report_abs(ctlr->imu_input, ABS_X,  sw2_s16le(p + 2));  /* acc X */
+	input_report_abs(ctlr->imu_input, ABS_RY, sw2_s16le(p + 4));  /* gyro Y */
+	input_report_abs(ctlr->imu_input, ABS_Y,  sw2_s16le(p + 6));  /* acc Y */
+	input_report_abs(ctlr->imu_input, ABS_RZ, sw2_s16le(p + 8));  /* gyro Z */
+	input_report_abs(ctlr->imu_input, ABS_Z,  sw2_s16le(p + 10)); /* acc Z */
+	input_sync(ctlr->imu_input);
+}
+
 static int sw2_hid_event(struct hid_device *hdev, struct hid_report *report,
 			 u8 *data, int size)
 {
@@ -393,6 +434,11 @@ static int sw2_hid_event(struct hid_device *hdev, struct hid_report *report,
 	}
 
 	input_sync(ctlr->input);
+
+	if (ctlr->imu_input && ctlr->imu_offset &&
+	    size >= ctlr->imu_offset + SW2_IMU_LEN)
+		sw2_report_imu(ctlr, data);
+
 	return 0;
 }
 
@@ -431,6 +477,46 @@ static int sw2_input_create(struct sw2_ctlr *ctlr)
 	return input_register_device(input);
 }
 
+static int sw2_imu_input_create(struct sw2_ctlr *ctlr)
+{
+	struct hid_device *hdev = ctlr->hdev;
+	struct input_dev *imu;
+	int g = SW2_IMU_GYRO_RES_PER_DPS;
+	int a = SW2_IMU_ACCEL_RES_PER_G;
+
+	imu = devm_input_allocate_device(&hdev->dev);
+	if (!imu)
+		return -ENOMEM;
+
+	imu->id.bustype = BUS_USB;
+	imu->id.vendor = hdev->vendor;
+	imu->id.product = hdev->product;
+	imu->id.version = hdev->version;
+	imu->name = devm_kasprintf(&hdev->dev, GFP_KERNEL, "%s IMU", hdev->name);
+	if (!imu->name)
+		return -ENOMEM;
+	input_set_drvdata(imu, ctlr);
+
+	/* accelerometer (g units) */
+	input_set_abs_params(imu, ABS_X, -32768, 32767, 0, 0);
+	input_set_abs_params(imu, ABS_Y, -32768, 32767, 0, 0);
+	input_set_abs_params(imu, ABS_Z, -32768, 32767, 0, 0);
+	input_abs_set_res(imu, ABS_X, a);
+	input_abs_set_res(imu, ABS_Y, a);
+	input_abs_set_res(imu, ABS_Z, a);
+	/* gyroscope (deg/s) */
+	input_set_abs_params(imu, ABS_RX, -32768, 32767, 0, 0);
+	input_set_abs_params(imu, ABS_RY, -32768, 32767, 0, 0);
+	input_set_abs_params(imu, ABS_RZ, -32768, 32767, 0, 0);
+	input_abs_set_res(imu, ABS_RX, g);
+	input_abs_set_res(imu, ABS_RY, g);
+	input_abs_set_res(imu, ABS_RZ, g);
+	__set_bit(INPUT_PROP_ACCELEROMETER, imu->propbit);
+
+	ctlr->imu_input = imu;
+	return input_register_device(imu);
+}
+
 static enum sw2_ctlr_type sw2_type_from_product(__u16 product)
 {
 	switch (product) {
@@ -467,6 +553,9 @@ static int sw2_hid_probe(struct hid_device *hdev,
 	ctlr->udev = interface_to_usbdev(to_usb_interface(hdev->dev.parent));
 	ctlr->type = sw2_type_from_product(id->product);
 	ctlr->input_report_id = sw2_input_report_ids[ctlr->type];
+	/* IMU offset only known for the Pro Controller so far. */
+	if (ctlr->type == SW2_CTLR_PROCON)
+		ctlr->imu_offset = SW2_OFF_IMU_PROCON;
 	hid_set_drvdata(hdev, ctlr);
 
 	ret = hid_parse(hdev);
@@ -494,6 +583,12 @@ static int sw2_hid_probe(struct hid_device *hdev,
 	ret = sw2_input_create(ctlr);
 	if (ret)
 		goto err_close;
+
+	if (ctlr->imu_offset) {
+		ret = sw2_imu_input_create(ctlr);
+		if (ret)
+			goto err_close;
+	}
 
 	return 0;
 
