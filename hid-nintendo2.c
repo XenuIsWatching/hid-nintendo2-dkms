@@ -31,6 +31,7 @@
  *   https://github.com/ikz87/NSW2-controller-enabler
  *   https://github.com/loserkidsblink/nsogcd
  *   https://github.com/Nadeflore/switch2-controllers
+ *   https://github.com/darthcloud/BlueRetro
  *   libsdl-org/SDL SDL_hidapi_switch2.c
  */
 
