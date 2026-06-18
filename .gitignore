@@ -13,3 +13,8 @@
 modules.order
 Module.symvers
 *.d
+
+# tooling caches
+__pycache__/
+*.pyc
+.checkpatch-camelcase*
