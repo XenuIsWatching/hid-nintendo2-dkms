@@ -29,8 +29,23 @@ These scripts send that handshake, then decode the resulting reports.
    (A/B/X/Y, dpad, L/R/ZL/ZR, +/-, Home, Capture, stick-clicks, and SL/SR on
    Joy-Cons). The full raw stream is also saved to `capture-<pid>-<ts>.log`.
 
-4. Hand the bit list back to update the button maps in
-   `drivers/hid/hid-nintendo2.c` (`nx2_procon_btns`, `nx2_joycon_btns`, etc.).
+4. Hand the bit list back to update the button maps in `hid-nintendo2.c`
+   (`sw2_procon_btns`, `sw2_joyconl_btns`, etc.).
+
+## IMU discovery mode
+
+Finds the gyro/accelerometer fields in the report:
+
+```bash
+sudo ./sw2_capture.py --pid 0x2069 --imu
+```
+
+Hold the controller **still** for a couple of seconds, then **rotate it slowly
+about each axis in turn** (pitch, then roll, then yaw). The live view prints the
+trailing report region interpreted as signed 16-bit little-endian values; on
+exit it prints a per-byte activity summary (range = max-min) and lists the most
+active byte offsets — those are the IMU. (An uncontrolled capture of the Pro
+Controller already points at roughly bytes 21..44.)
 
 ## Full USB capture (optional, for IMU/rumble/init RE)
 

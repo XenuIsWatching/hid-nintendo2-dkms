@@ -190,12 +190,106 @@ def decode_stick(d):
     return x, y
 
 
+def s16le(d, off):
+    """Signed 16-bit little-endian at byte offset off."""
+    return int.from_bytes(d[off:off + 2], "little", signed=True)
+
+
+def monitor_buttons(hf, log, pid):
+    """Stream input reports and print which button bits change."""
+    print("Press buttons one at a time. Ctrl-C to stop.\n")
+    names = BIT_NAMES.get(pid, {})
+    prev_btns = 0
+    while True:
+        data = os.read(hf, 64)
+        if not data:
+            break
+        log.write(data.hex() + "\n")
+        if len(data) < OFF_STICK_R + 3:
+            continue
+        btns = (data[OFF_BUTTONS] | (data[OFF_BUTTONS + 1] << 8) |
+                (data[OFF_BUTTONS + 2] << 16))
+        if btns != prev_btns:
+            newly = btns & ~prev_btns
+            bits = [i for i in range(24) if newly & (1 << i)]
+            lx, ly = decode_stick(data[OFF_STICK_L:OFF_STICK_L + 3])
+            rx, ry = decode_stick(data[OFF_STICK_R:OFF_STICK_R + 3])
+            msg = (f"id=0x{data[0]:02x} btns={btns:024b} "
+                   f"L=({lx:4d},{ly:4d}) R=({rx:4d},{ry:4d})")
+            if bits:
+                labelled = ", ".join(f"{i}={names.get(i, '?')}" for i in bits)
+                msg += f"  >>> NEW BIT(S): [{labelled}]"
+            print(msg)
+            log.write(f"# {msg}\n")
+            prev_btns = btns
+
+
+# Byte offset where the trailing vendor/IMU region begins (after buttons,
+# sticks, and the GameCube trigger bytes). The IMU data is expected somewhere
+# in here.
+IMU_SCAN_START = 15
+
+
+def monitor_imu(hf, log, pid):
+    """
+    Help locate the IMU (gyro/accel) fields. Hold the controller still, then
+    rotate it slowly about each axis in turn. Live view shows the trailing
+    region interpreted as signed 16-bit LE values; on exit a per-byte activity
+    summary highlights which offsets actually move (those are the IMU).
+    """
+    print("IMU mode: keep the controller STILL for ~2s, then rotate slowly\n"
+          "about each axis (pitch, roll, yaw). Ctrl-C to stop.\n")
+    bmin = [255] * 64
+    bmax = [0] * 64
+    last_print = 0.0
+    n = 0
+    try:
+        while True:
+            data = os.read(hf, 64)
+            if not data:
+                break
+            log.write(data.hex() + "\n")
+            n += 1
+            for i in range(min(len(data), 64)):
+                bmin[i] = min(bmin[i], data[i])
+                bmax[i] = max(bmax[i], data[i])
+            now = time.monotonic()
+            if now - last_print >= 0.15:
+                last_print = now
+                vals = " ".join(
+                    f"{off}:{s16le(data, off):>6d}"
+                    for off in range(IMU_SCAN_START, len(data) - 1, 2))
+                print(f"id=0x{data[0]:02x} s16le[{IMU_SCAN_START}..]: {vals}")
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        _imu_summary(bmin, bmax, n)
+
+
+def _imu_summary(bmin, bmax, n):
+    print(f"\n--- byte activity over {n} reports (range = max-min) ---")
+    print("offset  range   min   max   (* = likely IMU/active)")
+    for i in range(64):
+        if bmax[i] < bmin[i]:
+            continue
+        rng = bmax[i] - bmin[i]
+        mark = " *" if rng >= 16 else ""
+        if rng > 0:
+            print(f"  {i:2d}    {rng:4d}   {bmin[i]:3d}   {bmax[i]:3d}{mark}")
+    active = [i for i in range(64) if bmax[i] >= bmin[i]
+              and bmax[i] - bmin[i] >= 16]
+    if active:
+        print(f"\nMost active byte offsets (candidate IMU region): {active}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pid", required=True,
                     help="product id, e.g. 0x2069")
     ap.add_argument("--no-init", action="store_true",
                     help="skip handshake (controller already initialized)")
+    ap.add_argument("--imu", action="store_true",
+                    help="IMU/gyro discovery mode (rotate the controller)")
     args = ap.parse_args()
     pid = int(args.pid, 0)
 
@@ -219,42 +313,22 @@ def main():
         print("Could not find hidraw node for the controller.",
               file=sys.stderr)
         return 1
-    print(f"Reading from {hidraw} -- press buttons one at a time. Ctrl-C to "
-          f"stop.\n")
+    print(f"Reading from {hidraw}")
 
-    logname = f"capture-{pid:04x}-{int(time.time())}.log"
+    mode = "imu" if args.imu else "buttons"
+    logname = f"capture-{pid:04x}-{mode}-{int(time.time())}.log"
     log = open(logname, "w")
     print(f"Logging raw reports to {logname}\n")
 
-    names = BIT_NAMES.get(pid, {})
-    prev_btns = 0
     hf = os.open(hidraw, os.O_RDONLY)
     try:
-        while True:
-            data = os.read(hf, 64)
-            if not data:
-                break
-            log.write(data.hex() + "\n")
-            if len(data) < OFF_STICK_R + 3:
-                continue
-            btns = (data[OFF_BUTTONS] | (data[OFF_BUTTONS + 1] << 8) |
-                    (data[OFF_BUTTONS + 2] << 16))
-            if btns != prev_btns:
-                newly = btns & ~prev_btns
-                bits = [i for i in range(24) if newly & (1 << i)]
-                lx, ly = decode_stick(data[OFF_STICK_L:OFF_STICK_L + 3])
-                rx, ry = decode_stick(data[OFF_STICK_R:OFF_STICK_R + 3])
-                msg = (f"id=0x{data[0]:02x} btns={btns:024b} "
-                       f"L=({lx:4d},{ly:4d}) R=({rx:4d},{ry:4d})")
-                if bits:
-                    labelled = ", ".join(f"{i}={names.get(i, '?')}"
-                                         for i in bits)
-                    msg += f"  >>> NEW BIT(S): [{labelled}]"
-                print(msg)
-                log.write(f"# {msg}\n")
-                prev_btns = btns
-    except KeyboardInterrupt:
-        print("\nStopped.")
+        if args.imu:
+            monitor_imu(hf, log, pid)
+        else:
+            try:
+                monitor_buttons(hf, log, pid)
+            except KeyboardInterrupt:
+                print("\nStopped.")
     finally:
         os.close(hf)
         log.close()
