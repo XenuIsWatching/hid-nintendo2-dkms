@@ -37,6 +37,7 @@
 #include <linux/hid.h>
 #include <linux/idr.h>
 #include <linux/input.h>
+#include <linux/ktime.h>
 #include <linux/leds.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -62,6 +63,30 @@
 #define SW2_INPUT_REPORT_JOYCONL	0x07
 #define SW2_INPUT_REPORT_JOYCONR	0x08
 #define SW2_INPUT_REPORT_NSOGC		0x0a
+
+/*
+ * Input report layout (USB, interface 0), as reverse-engineered. Offsets are
+ * for the Pro Controller (report 0x09); the right Joy-Con (0x08) shifts the
+ * sensor section onward by one byte (see SW2_OFF_IMU_JOYCONR). All multi-byte
+ * fields are little-endian. See docs/PROTOCOL.md for the full write-up.
+ *
+ *   off  size  field
+ *   0    1     report ID
+ *   1    1     packet counter (increments per report)
+ *   2    1     constant 0x20
+ *   3    3     buttons (bit-packed, see the per-type maps below)
+ *   6    3     left stick   (two 12-bit axes)
+ *   9    3     right stick  (two 12-bit axes; C-stick on GameCube)
+ *   13   1     left analog trigger  (GameCube only)
+ *   14   1     right analog trigger (GameCube only)
+ *   15   1     sensor-section marker 0x1e
+ *   16   2     hardware timestamp (unit unconfirmed)
+ *   18   2     constant marker 0x0c00
+ *   ~20  ..    frame counter + feature-gated mouse/magnetometer slots,
+ *              inactive unless enabled via the feature command (we enable
+ *              motion only; see the init sequence's 0x0c commands)
+ *   32   12    IMU sample: gyro/accel interleaved per axis (see SW2_OFF_IMU)
+ */
 
 /* Offsets within an input report (data[0] is the report ID). */
 #define SW2_OFF_BUTTONS		3	/* 3 bytes of bit-packed buttons */
@@ -119,6 +144,8 @@ struct sw2_ctlr {
 	struct mutex out_mutex;	/* serializes vendor OUT transfers */
 	struct led_classdev player_leds[SW2_NUM_PLAYER_LEDS];
 	int player_id;		/* assigned player number, -1 if none */
+	ktime_t imu_last;	/* time of previous IMU sample */
+	u32 imu_timestamp_us;	/* accumulated IMU timestamp (MSC_TIMESTAMP) */
 };
 
 /*
@@ -505,6 +532,7 @@ static s16 sw2_s16le(const u8 *p)
 static void sw2_report_imu(struct sw2_ctlr *ctlr, const u8 *data)
 {
 	const u8 *p = data + ctlr->imu_offset;
+	ktime_t now = ktime_get();
 
 	input_report_abs(ctlr->imu_input, ABS_RX, sw2_s16le(p + 0));  /* gyro X */
 	input_report_abs(ctlr->imu_input, ABS_X,  sw2_s16le(p + 2));  /* acc X */
@@ -512,6 +540,20 @@ static void sw2_report_imu(struct sw2_ctlr *ctlr, const u8 *data)
 	input_report_abs(ctlr->imu_input, ABS_Y,  sw2_s16le(p + 6));  /* acc Y */
 	input_report_abs(ctlr->imu_input, ABS_RZ, sw2_s16le(p + 8));  /* gyro Z */
 	input_report_abs(ctlr->imu_input, ABS_Z,  sw2_s16le(p + 10)); /* acc Z */
+
+	/*
+	 * Report a monotonic microsecond timestamp accumulated from the
+	 * measured inter-sample interval. The report does carry a 16-bit
+	 * hardware timestamp, but its unit is unconfirmed, so we use the
+	 * measured arrival time instead.
+	 */
+	if (ctlr->imu_last)
+		ctlr->imu_timestamp_us +=
+			ktime_to_us(ktime_sub(now, ctlr->imu_last));
+	ctlr->imu_last = now;
+	input_event(ctlr->imu_input, EV_MSC, MSC_TIMESTAMP,
+		    ctlr->imu_timestamp_us);
+
 	input_sync(ctlr->imu_input);
 }
 
@@ -613,6 +655,7 @@ static int sw2_imu_input_create(struct sw2_ctlr *ctlr)
 	input_abs_set_res(imu, ABS_RX, g);
 	input_abs_set_res(imu, ABS_RY, g);
 	input_abs_set_res(imu, ABS_RZ, g);
+	input_set_capability(imu, EV_MSC, MSC_TIMESTAMP);
 	__set_bit(INPUT_PROP_ACCELEROMETER, imu->propbit);
 
 	ctlr->imu_input = imu;

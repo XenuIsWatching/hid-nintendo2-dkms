@@ -35,6 +35,10 @@ driver.
   (offsets decoded from capture; per-axis signs/gyro scale may need refinement).
 - ⬜ Rumble, player LEDs, battery, Joy-Con mouse.
 
+See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the reverse-engineered USB
+protocol (report layout, button maps, init handshake, feature flags, IMU/LED
+commands).
+
 ## Requirements
 
 - Kernel headers for your running kernel (`linux-headers-$(uname -r)` /
