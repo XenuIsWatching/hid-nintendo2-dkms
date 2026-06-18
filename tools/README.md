@@ -64,15 +64,20 @@ LEDs also appear under `/sys/class/leds/*player-*` and can be toggled with
 
 The haptic payload format is known (5-byte frames, packet = `0x50|id` + 3
 frames); only how it is framed over the USB vendor endpoint is unconfirmed.
-This mode drives strong rumble using two candidate framings so you can confirm
-by feel:
+Raw vibration packets on the vendor bulk OUT do nothing (that channel is for
+commands; over BLE vibration uses a separate characteristic). This mode tries
+the more likely USB paths so you can confirm by feel:
 
 ```bash
 sudo ./sw2_capture.py --pid 0x2069 --rumble
 ```
 
-It runs "Variant A" (with a leading `0x00`) then "Variant B" (no prefix);
-report which one buzzes.
+It runs, with pauses between each:
+- **Variant C** — HID output report (`id + packet`) over interface 0 via hidraw
+- **Variant D** — HID output report (`id + 0x00 + packet`)
+- **Variant E** — command-framed (`cmd 0x0a`) over the vendor bulk OUT
+
+Report which variant (if any) buzzes.
 
 ## Full USB capture (optional, for IMU/rumble/init RE)
 

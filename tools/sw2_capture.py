@@ -204,28 +204,54 @@ def vib_frame(lf_amp, hf_amp, lf_freq=0x0e1, hf_freq=0x1e1):
     return v.to_bytes(5, "little")
 
 
-def send_vib(fd, pid, lf_amp, hf_amp, pkt_id, prefix=b"\x00"):
-    """Send one vibration packet over the vendor bulk OUT endpoint."""
-    packet = bytes([0x50 | (pkt_id & 0x0f)]) + vib_frame(lf_amp, hf_amp) * 3
-    # Pro Controller takes two motor packets (left + right); others take one.
-    body = packet * 2 if pid == 0x2069 else packet
-    usb_bulk(fd, EP_OUT, prefix + body, len(prefix) + len(body), 1000)
+# Per-controller HID output report ID (from the HID descriptors).
+HID_OUT_REPORT_ID = {0x2069: 0x02, 0x2067: 0x01, 0x2066: 0x01, 0x2073: 0x03}
 
 
-def rumble_test(fd, pid, prefix=b"\x00"):
-    """Drive rumble for ~1.5 s so you can confirm the USB framing by feel."""
-    print("Rumbling ~1.5s (strong)... do you feel it? Ctrl-C to stop.\n")
+def motor_packet(pid, lf_amp, hf_amp, pkt_id):
+    """[0x50|id] + 3 haptic frames; doubled for the Pro (two motors)."""
+    pkt = bytes([0x50 | (pkt_id & 0x0f)]) + vib_frame(lf_amp, hf_amp) * 3
+    return pkt * 2 if pid == 0x2069 else pkt
+
+
+def _drive(send, n=48):
     try:
-        for i in range(60):
-            send_vib(fd, pid, 700, 700, i, prefix)
+        for i in range(n):
+            send(i)
             time.sleep(0.025)
     except KeyboardInterrupt:
         pass
+    for i in range(3):
+        send(i, stop=True)
+        time.sleep(0.01)
+
+
+def rumble_hidraw(pid, lead):
+    """Send rumble as a HID output report over interface 0 (via hidraw)."""
+    path = find_hidraw(pid)
+    if not path:
+        print("  no hidraw node; skipping")
+        return
+    rid = HID_OUT_REPORT_ID.get(pid, 0x01)
+    hf = os.open(path, os.O_RDWR)
+    try:
+        def send(i, stop=False):
+            amp = 0 if stop else 700
+            body = bytes([rid]) + lead + motor_packet(pid, amp, amp, i)
+            os.write(hf, body.ljust(64, b"\x00"))
+        _drive(send)
     finally:
-        for i in range(3):           # stop: zero amplitude
-            send_vib(fd, pid, 0, 0, i, prefix)
-            time.sleep(0.01)
-    print("Done.")
+        os.close(hf)
+
+
+def rumble_vendor_cmd(fd, pid):
+    """Send rumble command-framed (cmd 0x0a) over the vendor bulk OUT."""
+    def send(i, stop=False):
+        amp = 0 if stop else 700
+        mp = motor_packet(pid, amp, amp, i)
+        frame = bytes([0x0a, 0x91, 0x00, 0x02, 0x00, len(mp), 0x00, 0x00]) + mp
+        usb_bulk(fd, EP_OUT, frame, len(frame), 1000)
+    _drive(send)
 
 
 def led_test(fd):
@@ -375,11 +401,17 @@ def main():
         if args.leds:
             led_test(fd)
         if args.rumble:
-            print("=== Variant A: with 0x00 prefix ===")
-            rumble_test(fd, pid, b"\x00")
-            time.sleep(1.0)
-            print("\n=== Variant B: no prefix ===")
-            rumble_test(fd, pid, b"")
+            variants = [
+                ("C: HID output report, id + packet", lambda: rumble_hidraw(pid, b"")),
+                ("D: HID output report, id + 0x00 + packet",
+                 lambda: rumble_hidraw(pid, b"\x00")),
+                ("E: vendor bulk, command-framed (cmd 0x0a)",
+                 lambda: rumble_vendor_cmd(fd, pid)),
+            ]
+            for label, fn in variants:
+                print(f"\n=== Variant {label} ===  (feel for ~1.2s)")
+                fn()
+                time.sleep(1.2)
             print("\nTell me which variant (if any) buzzed.")
         return 0
 
