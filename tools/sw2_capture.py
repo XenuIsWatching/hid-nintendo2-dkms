@@ -190,6 +190,27 @@ def decode_stick(d):
     return x, y
 
 
+# The Switch player-number LED patterns (players 1..8), as LED bitmasks
+# (bit 0 = LED 1). Matches the in-tree hid-nintendo driver.
+PLAYER_LED_PATTERNS = [0x01, 0x03, 0x07, 0x0f, 0x09, 0x05, 0x0d, 0x06]
+
+
+def led_test(fd):
+    """Cycle the player 1..8 LED patterns (vendor cmd 0x09 sub 0x07)."""
+    print("Cycling player 1..8 LED patterns -- watch the controller. "
+          "Ctrl-C to stop.\n")
+    try:
+        for n, mask in enumerate(PLAYER_LED_PATTERNS, 1):
+            cmd = bytes([0x09, 0x91, 0x00, 0x07, 0x00, 0x08, 0x00, 0x00,
+                         mask, 0, 0, 0, 0, 0, 0, 0])
+            usb_bulk(fd, EP_OUT, cmd, len(cmd), 1000)
+            print(f"  player {n}: mask 0x{mask:02x}  "
+                  f"LEDs[{''.join('*' if mask & (1 << i) else '.' for i in range(4))}]")
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+
 def s16le(d, off):
     """Signed 16-bit little-endian at byte offset off."""
     return int.from_bytes(d[off:off + 2], "little", signed=True)
@@ -290,6 +311,8 @@ def main():
                     help="skip handshake (controller already initialized)")
     ap.add_argument("--imu", action="store_true",
                     help="IMU/gyro discovery mode (rotate the controller)")
+    ap.add_argument("--leds", action="store_true",
+                    help="cycle the player 1..8 LED patterns and exit")
     args = ap.parse_args()
     pid = int(args.pid, 0)
 
@@ -304,9 +327,18 @@ def main():
         return 1
     print(f"USB device: {devnode}")
 
+    fd = None
     if not args.no_init:
-        do_init(devnode)
+        fd = do_init(devnode)
         time.sleep(0.5)
+
+    if args.leds:
+        if fd is None:
+            fd = os.open(devnode, os.O_RDWR)
+            fcntl.ioctl(fd, USBDEVFS_CLAIMINTERFACE,
+                        struct.pack("I", VENDOR_INTERFACE))
+        led_test(fd)
+        return 0
 
     hidraw = find_hidraw(pid)
     if not hidraw:

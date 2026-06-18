@@ -47,6 +47,19 @@ exit it prints a per-byte activity summary (range = max-min) and lists the most
 active byte offsets — those are the IMU. (An uncontrolled capture of the Pro
 Controller already points at roughly bytes 21..44.)
 
+## LED test mode
+
+Verify the player-LED command (vendor `cmd=0x09 sub=0x07`) without loading the
+kernel module — it cycles the player 1..8 patterns on the controller:
+
+```bash
+sudo ./sw2_capture.py --pid 0x2069 --leds
+```
+
+The same patterns are used by the kernel driver. Once the driver is loaded, the
+LEDs also appear under `/sys/class/leds/*player-*` and can be toggled with
+`echo 1 | sudo tee /sys/class/leds/<name>/brightness`.
+
 ## Full USB capture (optional, for IMU/rumble/init RE)
 
 Captures all USB traffic on the controller's bus via usbmon while initializing:

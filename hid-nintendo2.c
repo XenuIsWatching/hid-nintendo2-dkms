@@ -35,8 +35,11 @@
  */
 
 #include <linux/hid.h>
+#include <linux/idr.h>
 #include <linux/input.h>
+#include <linux/leds.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/usb.h>
 
@@ -86,6 +89,10 @@
  */
 #define SW2_IMU_GYRO_RES_PER_DPS	14247
 
+/* Player LEDs: vendor command 0x09, subcommand 0x07, bitmask at payload byte. */
+#define SW2_NUM_PLAYER_LEDS	4
+#define SW2_NUM_LED_PATTERNS	8
+
 #define SW2_STICK_CENTER	2048	/* 12-bit stick midpoint */
 #define SW2_STICK_MAX		4095
 /* GameCube analog triggers report roughly 0x24..0xf0; remap to 0..255. */
@@ -109,7 +116,20 @@ struct sw2_ctlr {
 	u8 imu_offset;		/* report offset of IMU sample, 0 if none */
 	unsigned int ep_out;	/* bulk OUT pipe on the vendor interface */
 	unsigned int ep_in;	/* bulk IN pipe on the vendor interface */
+	struct mutex out_mutex;	/* serializes vendor OUT transfers */
+	struct led_classdev player_leds[SW2_NUM_PLAYER_LEDS];
+	int player_id;		/* assigned player number, -1 if none */
 };
+
+/*
+ * Player-number LED patterns (players 1..8), as LED bitmasks (bit 0 = LED 1).
+ * Matches the in-tree hid-nintendo driver's patterns.
+ */
+static const u8 sw2_player_led_patterns[SW2_NUM_LED_PATTERNS] = {
+	0x01, 0x03, 0x07, 0x0f, 0x09, 0x05, 0x0d, 0x06,
+};
+
+static DEFINE_IDA(sw2_player_ida);
 
 /*
  * One entry maps a button bit (bit_nr counts from the LSB of the first button
@@ -366,6 +386,85 @@ out:
 	return ret;
 }
 
+/* Set the four player-indicator LEDs from a bitmask (bit 0 = LED 1). */
+static int sw2_set_player_leds(struct sw2_ctlr *ctlr, u8 mask)
+{
+	u8 cmd[16] = { 0x09, 0x91, 0x00, 0x07, 0x00, 0x08, 0x00, 0x00, mask };
+	u8 *buf;
+	int ret, actual;
+
+	buf = kmemdup(cmd, sizeof(cmd), GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	mutex_lock(&ctlr->out_mutex);
+	ret = usb_bulk_msg(ctlr->udev, ctlr->ep_out, buf, sizeof(cmd),
+			   &actual, 1000);
+	mutex_unlock(&ctlr->out_mutex);
+
+	kfree(buf);
+	return ret;
+}
+
+/*
+ * The vendor command sets all four LEDs at once, so gather the state of every
+ * LED into a mask and send them together (the brightness argument is ignored).
+ */
+static int sw2_player_led_set(struct led_classdev *led,
+			      enum led_brightness brightness)
+{
+	struct hid_device *hdev = to_hid_device(led->dev->parent);
+	struct sw2_ctlr *ctlr = hid_get_drvdata(hdev);
+	u8 mask = 0;
+	int i;
+
+	if (!ctlr)
+		return -ENODEV;
+
+	for (i = 0; i < SW2_NUM_PLAYER_LEDS; i++)
+		if (ctlr->player_leds[i].brightness)
+			mask |= BIT(i);
+
+	return sw2_set_player_leds(ctlr, mask);
+}
+
+static int sw2_leds_create(struct sw2_ctlr *ctlr)
+{
+	struct hid_device *hdev = ctlr->hdev;
+	struct device *dev = &hdev->dev;
+	int i, ret, pattern;
+	u8 mask;
+
+	/* Assign a unique player number and map it to an LED pattern. */
+	ret = ida_alloc(&sw2_player_ida, GFP_KERNEL);
+	if (ret < 0)
+		return ret;
+	ctlr->player_id = ret;
+	pattern = ret % SW2_NUM_LED_PATTERNS;
+	mask = sw2_player_led_patterns[pattern];
+	hid_info(hdev, "assigned player %d\n", pattern + 1);
+
+	for (i = 0; i < SW2_NUM_PLAYER_LEDS; i++) {
+		struct led_classdev *led = &ctlr->player_leds[i];
+
+		led->name = devm_kasprintf(dev, GFP_KERNEL, "%s:green:player-%d",
+					   dev_name(dev), i + 1);
+		if (!led->name)
+			return -ENOMEM;
+		led->brightness = !!(mask & BIT(i));
+		led->max_brightness = 1;
+		led->brightness_set_blocking = sw2_player_led_set;
+		led->flags = LED_CORE_SUSPENDRESUME | LED_HW_PLUGGABLE;
+
+		ret = devm_led_classdev_register(dev, led);
+		if (ret)
+			return ret;
+	}
+
+	/* Reflect the assigned player pattern on the hardware. */
+	return sw2_set_player_leds(ctlr, mask);
+}
+
 static void sw2_report_buttons(struct sw2_ctlr *ctlr, const u8 *data)
 {
 	const struct sw2_button_map *map = sw2_button_map_for(ctlr->type);
@@ -554,6 +653,8 @@ static int sw2_hid_probe(struct hid_device *hdev,
 
 	ctlr->hdev = hdev;
 	ctlr->udev = interface_to_usbdev(to_usb_interface(hdev->dev.parent));
+	ctlr->player_id = -1;
+	mutex_init(&ctlr->out_mutex);
 	ctlr->type = sw2_type_from_product(id->product);
 	ctlr->input_report_id = sw2_input_report_ids[ctlr->type];
 	/* IMU offset confirmed for all four controllers (R Joy-Con is +1). */
@@ -595,6 +696,10 @@ static int sw2_hid_probe(struct hid_device *hdev,
 			goto err_close;
 	}
 
+	ret = sw2_leds_create(ctlr);
+	if (ret)
+		hid_warn(hdev, "failed to register player LEDs: %d\n", ret);
+
 	return 0;
 
 err_close:
@@ -606,6 +711,10 @@ err_stop:
 
 static void sw2_hid_remove(struct hid_device *hdev)
 {
+	struct sw2_ctlr *ctlr = hid_get_drvdata(hdev);
+
+	if (ctlr && ctlr->player_id >= 0)
+		ida_free(&sw2_player_ida, ctlr->player_id);
 	hid_hw_close(hdev);
 	hid_hw_stop(hdev);
 }
@@ -630,7 +739,20 @@ static struct hid_driver sw2_hid_driver = {
 	.remove		= sw2_hid_remove,
 	.raw_event	= sw2_hid_event,
 };
-module_hid_driver(sw2_hid_driver);
+
+static int __init sw2_init(void)
+{
+	return hid_register_driver(&sw2_hid_driver);
+}
+
+static void __exit sw2_exit(void)
+{
+	hid_unregister_driver(&sw2_hid_driver);
+	ida_destroy(&sw2_player_ida);
+}
+
+module_init(sw2_init);
+module_exit(sw2_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Ryan McClelland <rymcclel@gmail.com>");
