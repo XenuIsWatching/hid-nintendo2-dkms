@@ -42,7 +42,9 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/usb.h>
+#include <linux/workqueue.h>
 
 /*
  * Device IDs. Mirrors the relevant entries from the in-tree
@@ -118,6 +120,20 @@
 #define SW2_NUM_PLAYER_LEDS	4
 #define SW2_NUM_LED_PATTERNS	8
 
+/*
+ * Rumble is delivered as a HID output report on interface 0 (NOT the vendor
+ * channel). Payload after the report ID is one or more motor packets, each
+ * [0x50 | rolling_id] followed by three 5-byte haptic frames. The Pro sends two
+ * motor packets (left, right); Joy-Cons send one. Each 5-byte frame packs
+ * lf_freq(9) | lf_amp(10) | hf_freq(9) | hf_amp(10) little-endian. Confirmed
+ * for the Pro Controller and both Joy-Con 2; the GameCube path is unconfirmed.
+ */
+#define SW2_VIB_LF_FREQ		0x0e1
+#define SW2_VIB_HF_FREQ		0x1e1
+#define SW2_VIB_AMP_MAX		800
+#define SW2_VIB_FRAME_LEN	5
+#define SW2_RUMBLE_PERIOD_MS	30	/* resend interval while active */
+
 #define SW2_STICK_CENTER	2048	/* 12-bit stick midpoint */
 #define SW2_STICK_MAX		4095
 /* GameCube analog triggers report roughly 0x24..0xf0; remap to 0..255. */
@@ -146,6 +162,14 @@ struct sw2_ctlr {
 	int player_id;		/* assigned player number, -1 if none */
 	ktime_t imu_last;	/* time of previous IMU sample */
 	u32 imu_timestamp_us;	/* accumulated IMU timestamp (MSC_TIMESTAMP) */
+	u8 out_report_id;	/* HID output report ID for rumble */
+	bool has_rumble;
+	struct delayed_work rumble_work;
+	spinlock_t rumble_lock;	/* protects the fields below */
+	u16 rumble_lf;		/* low-freq amplitude */
+	u16 rumble_hf;		/* high-freq amplitude */
+	bool rumble_active;
+	u8 rumble_pkt_id;	/* rolling 4-bit packet counter */
 };
 
 /*
@@ -492,6 +516,91 @@ static int sw2_leds_create(struct sw2_ctlr *ctlr)
 	return sw2_set_player_leds(ctlr, mask);
 }
 
+/* Encode one 5-byte haptic frame at p. */
+static void sw2_vib_frame(u8 *p, u16 lf_amp, u16 hf_amp)
+{
+	u64 v = SW2_VIB_LF_FREQ & 0x1ff;
+
+	v |= (u64)(lf_amp & 0x3ff) << 10;
+	v |= (u64)(SW2_VIB_HF_FREQ & 0x1ff) << 20;
+	v |= (u64)(hf_amp & 0x3ff) << 30;
+	p[0] = v;
+	p[1] = v >> 8;
+	p[2] = v >> 16;
+	p[3] = v >> 24;
+	p[4] = v >> 32;
+}
+
+/* Build and send the current rumble state as a HID output report. */
+static void sw2_send_rumble(struct sw2_ctlr *ctlr)
+{
+	u8 buf[64] = { 0 };
+	int pos = 0, motors, m, f;
+	unsigned long flags;
+	u16 lf, hf;
+
+	spin_lock_irqsave(&ctlr->rumble_lock, flags);
+	lf = ctlr->rumble_lf;
+	hf = ctlr->rumble_hf;
+	spin_unlock_irqrestore(&ctlr->rumble_lock, flags);
+
+	buf[pos++] = ctlr->out_report_id;
+	motors = (ctlr->type == SW2_CTLR_PROCON) ? 2 : 1;
+	for (m = 0; m < motors; m++) {
+		buf[pos++] = 0x50 | (ctlr->rumble_pkt_id & 0x0f);
+		for (f = 0; f < 3; f++) {
+			sw2_vib_frame(&buf[pos], lf, hf);
+			pos += SW2_VIB_FRAME_LEN;
+		}
+	}
+	ctlr->rumble_pkt_id++;
+
+	hid_hw_output_report(ctlr->hdev, buf, sizeof(buf));
+}
+
+static void sw2_rumble_worker(struct work_struct *work)
+{
+	struct sw2_ctlr *ctlr =
+		container_of(to_delayed_work(work), struct sw2_ctlr, rumble_work);
+	unsigned long flags;
+	bool active;
+
+	sw2_send_rumble(ctlr);
+
+	spin_lock_irqsave(&ctlr->rumble_lock, flags);
+	active = ctlr->rumble_active;
+	spin_unlock_irqrestore(&ctlr->rumble_lock, flags);
+
+	/* Resend periodically to sustain the effect; one final zero packet stops. */
+	if (active)
+		schedule_delayed_work(&ctlr->rumble_work,
+				      msecs_to_jiffies(SW2_RUMBLE_PERIOD_MS));
+}
+
+/* FF_RUMBLE callback (memless). Runs in atomic context: only stash + schedule. */
+static int sw2_play_effect(struct input_dev *dev, void *data,
+			   struct ff_effect *effect)
+{
+	struct sw2_ctlr *ctlr = input_get_drvdata(dev);
+	unsigned long flags;
+	u16 lf, hf;
+
+	if (effect->type != FF_RUMBLE)
+		return 0;
+
+	lf = (u32)effect->u.rumble.strong_magnitude * SW2_VIB_AMP_MAX / 0xffff;
+	hf = (u32)effect->u.rumble.weak_magnitude * SW2_VIB_AMP_MAX / 0xffff;
+
+	spin_lock_irqsave(&ctlr->rumble_lock, flags);
+	ctlr->rumble_lf = lf;
+	ctlr->rumble_hf = hf;
+	ctlr->rumble_active = lf || hf;
+	spin_unlock_irqrestore(&ctlr->rumble_lock, flags);
+
+	mod_delayed_work(system_wq, &ctlr->rumble_work, 0);
+	return 0;
+}
+
 static void sw2_report_buttons(struct sw2_ctlr *ctlr, const u8 *data)
 {
 	const struct sw2_button_map *map = sw2_button_map_for(ctlr->type);
@@ -617,6 +726,15 @@ static int sw2_input_create(struct sw2_ctlr *ctlr)
 		input_set_abs_params(input, ABS_RZ, 0, 255, 0, 0);
 	}
 
+	if (ctlr->has_rumble) {
+		int ret;
+
+		input_set_capability(input, EV_FF, FF_RUMBLE);
+		ret = input_ff_create_memless(input, NULL, sw2_play_effect);
+		if (ret)
+			return ret;
+	}
+
 	ctlr->input = input;
 	return input_register_device(input);
 }
@@ -705,6 +823,27 @@ static int sw2_hid_probe(struct hid_device *hdev,
 		ctlr->imu_offset = SW2_OFF_IMU_JOYCONR;
 	else
 		ctlr->imu_offset = SW2_OFF_IMU;
+
+	/*
+	 * Rumble via HID output report. Report IDs come from the descriptors;
+	 * confirmed working for the Pro and both Joy-Con 2. The GameCube path is
+	 * not yet confirmed, so leave its rumble disabled.
+	 */
+	spin_lock_init(&ctlr->rumble_lock);
+	INIT_DELAYED_WORK(&ctlr->rumble_work, sw2_rumble_worker);
+	switch (ctlr->type) {
+	case SW2_CTLR_PROCON:
+		ctlr->out_report_id = 0x02;
+		ctlr->has_rumble = true;
+		break;
+	case SW2_CTLR_JOYCONL:
+	case SW2_CTLR_JOYCONR:
+		ctlr->out_report_id = 0x01;
+		ctlr->has_rumble = true;
+		break;
+	default:
+		break;
+	}
 	hid_set_drvdata(hdev, ctlr);
 
 	ret = hid_parse(hdev);
@@ -756,8 +895,11 @@ static void sw2_hid_remove(struct hid_device *hdev)
 {
 	struct sw2_ctlr *ctlr = hid_get_drvdata(hdev);
 
-	if (ctlr && ctlr->player_id >= 0)
-		ida_free(&sw2_player_ida, ctlr->player_id);
+	if (ctlr) {
+		cancel_delayed_work_sync(&ctlr->rumble_work);
+		if (ctlr->player_id >= 0)
+			ida_free(&sw2_player_ida, ctlr->player_id);
+	}
 	hid_hw_close(hdev);
 	hid_hw_stop(hdev);
 }

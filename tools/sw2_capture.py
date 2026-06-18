@@ -219,11 +219,16 @@ def _drive(send, n=48):
         for i in range(n):
             send(i)
             time.sleep(0.025)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, OSError) as e:
+        if isinstance(e, OSError):
+            print(f"  send failed: {e} (this variant not supported)")
+            return
+    try:
+        for i in range(3):           # stop: zero amplitude
+            send(i, stop=True)
+            time.sleep(0.01)
+    except OSError:
         pass
-    for i in range(3):
-        send(i, stop=True)
-        time.sleep(0.01)
 
 
 def rumble_hidraw(pid, lead):

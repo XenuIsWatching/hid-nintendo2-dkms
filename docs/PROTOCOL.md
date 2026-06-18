@@ -76,6 +76,27 @@ byte 0:
 The driver assigns a unique player number (IDA) and maps it to the standard
 Switch player patterns: P1..P8 = `0x01 0x03 0x07 0x0f 0x09 0x05 0x0d 0x06`.
 
+### Rumble (HID output report, interface 0)
+
+Rumble does **not** go over the vendor channel — it is a **HID output report**
+on interface 0 (confirmed by feel for the Pro Controller and both Joy-Con 2;
+GameCube unconfirmed). The report is:
+
+```
+<out_report_id> <motor packet> [<motor packet> ...]
+```
+
+- `out_report_id`: from the descriptor — Pro `0x02`, Joy-Con `0x01`,
+  GameCube `0x03`.
+- motor packet = `0x50|rolling_id` + three 5-byte haptic frames. The Pro takes
+  **two** motor packets (left, right); Joy-Cons take **one**.
+- 5-byte frame (40 bits LE): `lf_freq(9) | lf_amp(10)<<10 | hf_freq(9)<<20 |
+  hf_amp(10)<<30`. Defaults `lf_freq=0x0e1`, `hf_freq=0x1e1`; amplitude
+  `0..~800` (`≈ 800 * magnitude / 0xffff`).
+
+The driver exposes this as a memless `FF_RUMBLE` device (strong→lf_amp,
+weak→hf_amp) and resends every ~30 ms while active to sustain the effect.
+
 ## 3. Input report layout (interface 0)
 
 `data[0]` is the report ID (Pro `0x09`, GameCube `0x0a`, Joy-Con L `0x07`,
@@ -164,7 +185,8 @@ is not implemented over USB.
 - Mouse (Joy-Con): enable feature `0x10`, then decode the mouse coords/roughness/
   distance fields (BLE places them right after the sticks) → `REL_X`/`REL_Y`.
 - Magnetometer: enable feature `0x80`; no standard Linux joystick axis for it.
-- Rumble (HD Rumble 2.0): output format not yet reverse-engineered.
+- Rumble: solved for Pro + Joy-Con 2 (see above); GameCube output report path
+  returns ENODEV on write and is not yet working.
 - The pre-IMU bytes ~20..31 (frame counter + inactive feature slots) are only
   partially identified.
 - Joy-Con SL/SR button bits (9/10) are unverified guesses.
