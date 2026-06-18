@@ -31,9 +31,9 @@ driver.
 - ✅ Button maps confirmed for all four controllers (Joy-Con SL/SR rail buttons
   still tentative).
 - ✅ GameCube analog triggers (`ABS_Z` / `ABS_RZ`).
-- ✅ IMU (gyro + accel) on a separate input device — Pro Controller and GameCube
+- ✅ IMU (gyro + accel) on a separate input device — all four controllers
   (offsets decoded from capture; per-axis signs/gyro scale may need refinement).
-- ⬜ IMU for Joy-Con, rumble, player LEDs, battery, Joy-Con mouse.
+- ⬜ Rumble, player LEDs, battery, Joy-Con mouse.
 
 ## Requirements
 
