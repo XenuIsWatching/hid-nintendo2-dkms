@@ -159,6 +159,7 @@ struct sw2_ctlr {
 	unsigned int ep_in;	/* bulk IN pipe on the vendor interface */
 	struct mutex out_mutex;	/* serializes vendor OUT transfers */
 	struct led_classdev player_leds[SW2_NUM_PLAYER_LEDS];
+	u8 led_mask;		/* current player LED bitmask */
 	int player_id;		/* assigned player number, -1 if none */
 	ktime_t imu_last;	/* time of previous IMU sample */
 	u32 imu_timestamp_us;	/* accumulated IMU timestamp (MSC_TIMESTAMP) */
@@ -444,6 +445,8 @@ static int sw2_set_player_leds(struct sw2_ctlr *ctlr, u8 mask)
 	u8 *buf;
 	int ret, actual;
 
+	ctlr->led_mask = mask;
+
 	buf = kmemdup(cmd, sizeof(cmd), GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
@@ -545,12 +548,29 @@ static void sw2_send_rumble(struct sw2_ctlr *ctlr)
 	spin_unlock_irqrestore(&ctlr->rumble_lock, flags);
 
 	buf[pos++] = ctlr->out_report_id;
-	motors = (ctlr->type == SW2_CTLR_PROCON) ? 2 : 1;
-	for (m = 0; m < motors; m++) {
-		buf[pos++] = 0x50 | (ctlr->rumble_pkt_id & 0x0f);
-		for (f = 0; f < 3; f++) {
-			sw2_vib_frame(&buf[pos], lf, hf);
-			pos += SW2_VIB_FRAME_LEN;
+
+	if (ctlr->type == SW2_CTLR_NSOGC) {
+		/*
+		 * GameCube: simple on/off rumble (byte 2) in a report that also
+		 * carries the SET_LED command. Include the current LED mask so a
+		 * rumble does not disturb the player LEDs.
+		 */
+		buf[1] = 0x50 | (ctlr->rumble_pkt_id & 0x0f);
+		buf[2] = (lf || hf) ? 0x01 : 0x00;
+		buf[5] = 0x09;	/* CMD_SET_LED */
+		buf[6] = 0x91;	/* REQ */
+		buf[7] = 0x00;	/* interface = USB */
+		buf[8] = 0x07;	/* SUBCMD_SET_LED */
+		buf[10] = 0x08;
+		buf[13] = ctlr->led_mask;
+	} else {
+		motors = (ctlr->type == SW2_CTLR_PROCON) ? 2 : 1;
+		for (m = 0; m < motors; m++) {
+			buf[pos++] = 0x50 | (ctlr->rumble_pkt_id & 0x0f);
+			for (f = 0; f < 3; f++) {
+				sw2_vib_frame(&buf[pos], lf, hf);
+				pos += SW2_VIB_FRAME_LEN;
+			}
 		}
 	}
 	ctlr->rumble_pkt_id++;
@@ -825,23 +845,24 @@ static int sw2_hid_probe(struct hid_device *hdev,
 		ctlr->imu_offset = SW2_OFF_IMU;
 
 	/*
-	 * Rumble via HID output report. Report IDs come from the descriptors;
-	 * confirmed working for the Pro and both Joy-Con 2. The GameCube path is
-	 * not yet confirmed, so leave its rumble disabled.
+	 * Rumble via HID output report. Report IDs come from the descriptors.
+	 * Pro/Joy-Con use HD haptic frames; the GameCube uses a simple on/off
+	 * report (see sw2_send_rumble). All confirmed by testing.
 	 */
 	spin_lock_init(&ctlr->rumble_lock);
 	INIT_DELAYED_WORK(&ctlr->rumble_work, sw2_rumble_worker);
+	ctlr->has_rumble = true;
 	switch (ctlr->type) {
-	case SW2_CTLR_PROCON:
-		ctlr->out_report_id = 0x02;
-		ctlr->has_rumble = true;
-		break;
 	case SW2_CTLR_JOYCONL:
 	case SW2_CTLR_JOYCONR:
 		ctlr->out_report_id = 0x01;
-		ctlr->has_rumble = true;
 		break;
+	case SW2_CTLR_NSOGC:
+		ctlr->out_report_id = 0x03;
+		break;
+	case SW2_CTLR_PROCON:
 	default:
+		ctlr->out_report_id = 0x02;
 		break;
 	}
 	hid_set_drvdata(hdev, ctlr);

@@ -79,23 +79,30 @@ Switch player patterns: P1..P8 = `0x01 0x03 0x07 0x0f 0x09 0x05 0x0d 0x06`.
 ### Rumble (HID output report, interface 0)
 
 Rumble does **not** go over the vendor channel — it is a **HID output report**
-on interface 0 (confirmed by feel for the Pro Controller and both Joy-Con 2;
-GameCube unconfirmed). The report is:
+on interface 0 (confirmed by feel for all four controllers). `out_report_id` is
+from the descriptor: Pro `0x02`, Joy-Con `0x01`, GameCube `0x03`.
+
+**Pro / Joy-Con (HD rumble):**
 
 ```
-<out_report_id> <motor packet> [<motor packet> ...]
+<id> <motor packet> [<motor packet> ...]
 ```
-
-- `out_report_id`: from the descriptor — Pro `0x02`, Joy-Con `0x01`,
-  GameCube `0x03`.
 - motor packet = `0x50|rolling_id` + three 5-byte haptic frames. The Pro takes
   **two** motor packets (left, right); Joy-Cons take **one**.
 - 5-byte frame (40 bits LE): `lf_freq(9) | lf_amp(10)<<10 | hf_freq(9)<<20 |
   hf_amp(10)<<30`. Defaults `lf_freq=0x0e1`, `hf_freq=0x1e1`; amplitude
   `0..~800` (`≈ 800 * magnitude / 0xffff`).
 
-The driver exposes this as a memless `FF_RUMBLE` device (strong→lf_amp,
-weak→hf_amp) and resends every ~30 ms while active to sustain the effect.
+**GameCube (simple on/off, combined with the LED command — BlueRetro format):**
+
+```
+03 <0x50|id> <01=on|00=off> 00 00  09 91 00 07 00 08 00 00 <led_mask> ...
+```
+The rumble is a single on/off byte at offset 2; bytes 5.. carry an embedded
+SET_LED command, so the driver folds in the current player-LED mask.
+
+The driver exposes all of this as a memless `FF_RUMBLE` device (strong→lf_amp,
+weak→hf_amp; GameCube: any nonzero → on) and resends every ~30 ms while active.
 
 ## 3. Input report layout (interface 0)
 
@@ -185,8 +192,6 @@ is not implemented over USB.
 - Mouse (Joy-Con): enable feature `0x10`, then decode the mouse coords/roughness/
   distance fields (BLE places them right after the sticks) → `REL_X`/`REL_Y`.
 - Magnetometer: enable feature `0x80`; no standard Linux joystick axis for it.
-- Rumble: solved for Pro + Joy-Con 2 (see above); GameCube output report path
-  returns ENODEV on write and is not yet working.
 - The pre-IMU bytes ~20..31 (frame counter + inactive feature slots) are only
   partially identified.
 - Joy-Con SL/SR button bits (9/10) are unverified guesses.
@@ -194,5 +199,3 @@ is not implemented over USB.
   interface of its own), and pressing GL produced no bit change in the Joy-Con
   reports. Where GL/GR are exposed (a Joy-Con report field only set when grip-
   attached, or only over Bluetooth) is unknown.
-- GameCube rumble: HID-output write returns ENODEV; trying command-channel
-  framings (`cmd 0x0a`) per nsogcd's "command + rumble" handle.

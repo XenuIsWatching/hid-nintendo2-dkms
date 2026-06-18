@@ -34,8 +34,9 @@ driver.
 - ✅ IMU (gyro + accel) on a separate input device — all four controllers
   (offsets decoded from capture; per-axis signs/gyro scale may need refinement).
 - ✅ Player LEDs (all four controllers, with unique player-number assignment).
-- ✅ Rumble (`FF_RUMBLE`) — Pro Controller and both Joy-Con 2 (GameCube TBD).
-- ⬜ GameCube rumble, Joy-Con mouse (needs Bluetooth), battery (USB has none).
+- ✅ Rumble (`FF_RUMBLE`) — all four controllers (Pro/Joy-Con HD; GameCube on/off).
+- ⬜ Joy-Con mouse + SL/SR (need Bluetooth), charging-grip GL/GR, battery
+  (USB has none).
 
 See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the reverse-engineered USB
 protocol (report layout, button maps, init handshake, feature flags, IMU/LED
