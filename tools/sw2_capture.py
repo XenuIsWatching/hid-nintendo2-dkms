@@ -195,6 +195,39 @@ def decode_stick(d):
 PLAYER_LED_PATTERNS = [0x01, 0x03, 0x07, 0x0f, 0x09, 0x05, 0x0d, 0x06]
 
 
+def vib_frame(lf_amp, hf_amp, lf_freq=0x0e1, hf_freq=0x1e1):
+    """Build a 5-byte haptic frame (low/high freq amplitude)."""
+    v = (lf_freq & 0x1ff)
+    v |= (lf_amp & 0x3ff) << 10
+    v |= (hf_freq & 0x1ff) << 20
+    v |= (hf_amp & 0x3ff) << 30
+    return v.to_bytes(5, "little")
+
+
+def send_vib(fd, pid, lf_amp, hf_amp, pkt_id, prefix=b"\x00"):
+    """Send one vibration packet over the vendor bulk OUT endpoint."""
+    packet = bytes([0x50 | (pkt_id & 0x0f)]) + vib_frame(lf_amp, hf_amp) * 3
+    # Pro Controller takes two motor packets (left + right); others take one.
+    body = packet * 2 if pid == 0x2069 else packet
+    usb_bulk(fd, EP_OUT, prefix + body, len(prefix) + len(body), 1000)
+
+
+def rumble_test(fd, pid, prefix=b"\x00"):
+    """Drive rumble for ~1.5 s so you can confirm the USB framing by feel."""
+    print("Rumbling ~1.5s (strong)... do you feel it? Ctrl-C to stop.\n")
+    try:
+        for i in range(60):
+            send_vib(fd, pid, 700, 700, i, prefix)
+            time.sleep(0.025)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for i in range(3):           # stop: zero amplitude
+            send_vib(fd, pid, 0, 0, i, prefix)
+            time.sleep(0.01)
+    print("Done.")
+
+
 def led_test(fd):
     """Cycle the player 1..8 LED patterns (vendor cmd 0x09 sub 0x07)."""
     print("Cycling player 1..8 LED patterns -- watch the controller. "
@@ -313,6 +346,8 @@ def main():
                     help="IMU/gyro discovery mode (rotate the controller)")
     ap.add_argument("--leds", action="store_true",
                     help="cycle the player 1..8 LED patterns and exit")
+    ap.add_argument("--rumble", action="store_true",
+                    help="test rumble framing variants and exit")
     args = ap.parse_args()
     pid = int(args.pid, 0)
 
@@ -332,12 +367,20 @@ def main():
         fd = do_init(devnode)
         time.sleep(0.5)
 
-    if args.leds:
+    if args.leds or args.rumble:
         if fd is None:
             fd = os.open(devnode, os.O_RDWR)
             fcntl.ioctl(fd, USBDEVFS_CLAIMINTERFACE,
                         struct.pack("I", VENDOR_INTERFACE))
-        led_test(fd)
+        if args.leds:
+            led_test(fd)
+        if args.rumble:
+            print("=== Variant A: with 0x00 prefix ===")
+            rumble_test(fd, pid, b"\x00")
+            time.sleep(1.0)
+            print("\n=== Variant B: no prefix ===")
+            rumble_test(fd, pid, b"")
+            print("\nTell me which variant (if any) buzzed.")
         return 0
 
     hidraw = find_hidraw(pid)

@@ -60,6 +60,20 @@ The same patterns are used by the kernel driver. Once the driver is loaded, the
 LEDs also appear under `/sys/class/leds/*player-*` and can be toggled with
 `echo 1 | sudo tee /sys/class/leds/<name>/brightness`.
 
+## Rumble test mode
+
+The haptic payload format is known (5-byte frames, packet = `0x50|id` + 3
+frames); only how it is framed over the USB vendor endpoint is unconfirmed.
+This mode drives strong rumble using two candidate framings so you can confirm
+by feel:
+
+```bash
+sudo ./sw2_capture.py --pid 0x2069 --rumble
+```
+
+It runs "Variant A" (with a leading `0x00`) then "Variant B" (no prefix);
+report which one buzzes.
+
 ## Full USB capture (optional, for IMU/rumble/init RE)
 
 Captures all USB traffic on the controller's bus via usbmon while initializing:
