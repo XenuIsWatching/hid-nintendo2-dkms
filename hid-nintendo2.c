@@ -69,10 +69,11 @@
 
 /*
  * IMU: one sample per report, six s16 LE values interleaved per axis
- * (gyro then accel). Confirmed for the Pro Controller (report 0x09) via a
- * rotation capture; other controllers' offsets are not yet known.
+ * (gyro then accel: gX,aX,gY,aY,gZ,aZ at +0,+2,...,+10). Confirmed at the same
+ * offset for the Pro Controller (report 0x09) and the GameCube controller
+ * (report 0x0a) via rotation captures. The Joy-Con 2 offset is not yet known.
  */
-#define SW2_OFF_IMU_PROCON	32	/* gX,aX,gY,aY,gZ,aZ at +0,+2,...,+10 */
+#define SW2_OFF_IMU		32
 #define SW2_IMU_LEN		12
 
 /* Accelerometer resolution: ~4096 LSB per g (rest |a| measured ~4096). */
@@ -553,9 +554,9 @@ static int sw2_hid_probe(struct hid_device *hdev,
 	ctlr->udev = interface_to_usbdev(to_usb_interface(hdev->dev.parent));
 	ctlr->type = sw2_type_from_product(id->product);
 	ctlr->input_report_id = sw2_input_report_ids[ctlr->type];
-	/* IMU offset only known for the Pro Controller so far. */
-	if (ctlr->type == SW2_CTLR_PROCON)
-		ctlr->imu_offset = SW2_OFF_IMU_PROCON;
+	/* IMU offset confirmed for the Pro and GameCube controllers. */
+	if (ctlr->type == SW2_CTLR_PROCON || ctlr->type == SW2_CTLR_NSOGC)
+		ctlr->imu_offset = SW2_OFF_IMU;
 	hid_set_drvdata(hdev, ctlr);
 
 	ret = hid_parse(hdev);
