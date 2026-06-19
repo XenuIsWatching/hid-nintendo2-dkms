@@ -22,14 +22,19 @@ waiting for mainline. It is the Switch 2 counterpart to the in-tree
 | Buttons + D-pad | ✅ | ✅ | ✅ |
 | Analog stick(s) | ✅ (2) | ✅ (1) | ✅ (2) |
 | Analog triggers | — | — | ✅ |
-| IMU (gyro + accel) | ✅ | ✅ | ✅ |
+| Accelerometer | ✅ | ✅ | ✅ |
+| Gyroscope | ✘ | ✘ | ✘ |
 | Player LEDs | ✅ | ✅ | ✅ |
 | Rumble (`FF_RUMBLE`) | ✅ | ✅ | ✅ (on/off) |
 
-Buttons and sticks are exposed on a standard input device; the IMU is a separate
-input device (accel on `ABS_X/Y/Z`, gyro on `ABS_RX/RY/RZ`,
-`INPUT_PROP_ACCELEROMETER`, `MSC_TIMESTAMP`). Player LEDs appear under
-`/sys/class/leds` and a unique player number is assigned per controller.
+Buttons and sticks are exposed on a standard input device; the accelerometer is
+a separate input device (`ABS_X/Y/Z`, `INPUT_PROP_ACCELEROMETER`,
+`MSC_TIMESTAMP`). Player LEDs appear under `/sys/class/leds` and a unique player
+number is assigned per controller.
+
+The **gyroscope is not decoded**: the report slots that sit where a gyro would
+go carry only noise over USB at the current config (see `docs/PROTOCOL.md`);
+recovering it needs more reverse-engineering.
 
 ## Not supported
 

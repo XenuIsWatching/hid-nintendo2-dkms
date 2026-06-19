@@ -100,11 +100,13 @@
 #define SW2_OFF_TRIGGER_R	14	/* analog right trigger (GameCube) */
 
 /*
- * IMU: one sample per report, six s16 LE values interleaved per axis
- * (gyro then accel: gX,aX,gY,aY,gZ,aZ at +0,+2,...,+10). Confirmed via rotation
- * captures. The Pro Controller (0x09), GameCube (0x0a) and left Joy-Con (0x07)
- * place it at offset 32; the right Joy-Con (0x08) has one extra byte first and
- * places it at offset 33.
+ * IMU block: one sample per report. The accelerometer is three s16 LE values at
+ * imu_offset + 2/6/10 (X/Y/Z), interleaved with three s16 slots at
+ * imu_offset + 0/4/8. Those interleaved slots LOOK like a gyro by position but
+ * carry only noise over USB at our config (uncorrelated sample-to-sample and
+ * non-zero at rest), so no usable gyro is decoded - see docs/PROTOCOL.md. The
+ * Pro (0x09), GameCube (0x0a) and left Joy-Con (0x07) place the block at offset
+ * 32; the right Joy-Con (0x08) has one extra leading byte (offset 33).
  */
 #define SW2_OFF_IMU		32
 #define SW2_OFF_IMU_JOYCONR	33
@@ -112,15 +114,6 @@
 
 /* Accelerometer resolution: ~4096 LSB per g (rest |a| measured ~4096). */
 #define SW2_IMU_ACCEL_RES_PER_G	4096
-/*
- * Gyro resolution in LSB per degree/s. We report the raw 16-bit sample, so this
- * is the raw sensitivity. The original Switch's is ~14.247 LSB/dps (the in-tree
- * hid-nintendo's 14247 is that value pre-scaled by 1000 because it scales the
- * reported values up by 1000 - we do not, so we must not copy 14247). Rounded
- * to an integer; still an estimate, pending a controlled known-angle capture to
- * confirm the Switch 2 value.
- */
-#define SW2_IMU_GYRO_RES_PER_DPS	14
 
 /* Command-frame fields shared by the LED command and the GameCube rumble report. */
 #define SW2_CMD_SET_LED		0x09
@@ -674,21 +667,20 @@ static void sw2_report_sticks(struct sw2_ctlr *ctlr, const u8 *data)
 }
 
 /*
- * Report the IMU sample. The six s16 values are interleaved per axis as
- * gyro,accel for X, then Y, then Z, starting at the controller's IMU offset.
- * Gyro is reported on ABS_R[XYZ], accel on ABS_[XYZ], on a separate input dev.
+ * Report the IMU sample. Only the accelerometer is decoded: the three accel
+ * s16 values sit at imu_offset + 2/6/10 (X/Y/Z), interleaved with three other
+ * s16 slots (imu_offset + 0/4/8) that, despite their position, carry only noise
+ * over USB at our config (uncorrelated and non-zero at rest), so they are NOT a
+ * usable gyro - see docs/PROTOCOL.md. Accel rests at ~4096 LSB/g.
  */
 static void sw2_report_imu(struct sw2_ctlr *ctlr, const u8 *data)
 {
 	const u8 *p = data + ctlr->info->imu_offset;
 	ktime_t now = ktime_get();
 
-	input_report_abs(ctlr->imu_input, ABS_RX, (s16)get_unaligned_le16(p + 0));
-	input_report_abs(ctlr->imu_input, ABS_X,  (s16)get_unaligned_le16(p + 2));
-	input_report_abs(ctlr->imu_input, ABS_RY, (s16)get_unaligned_le16(p + 4));
-	input_report_abs(ctlr->imu_input, ABS_Y,  (s16)get_unaligned_le16(p + 6));
-	input_report_abs(ctlr->imu_input, ABS_RZ, (s16)get_unaligned_le16(p + 8));
-	input_report_abs(ctlr->imu_input, ABS_Z,  (s16)get_unaligned_le16(p + 10));
+	input_report_abs(ctlr->imu_input, ABS_X, (s16)get_unaligned_le16(p + 2));
+	input_report_abs(ctlr->imu_input, ABS_Y, (s16)get_unaligned_le16(p + 6));
+	input_report_abs(ctlr->imu_input, ABS_Z, (s16)get_unaligned_le16(p + 10));
 
 	/*
 	 * Report a monotonic microsecond timestamp accumulated from the
@@ -794,20 +786,13 @@ static int sw2_imu_input_create(struct sw2_ctlr *ctlr)
 		return -ENOMEM;
 	input_set_drvdata(imu, ctlr);
 
-	/* accelerometer (g units) */
+	/* accelerometer only (the gyro slots carry noise over USB; see PROTOCOL.md) */
 	input_set_abs_params(imu, ABS_X, -32768, 32767, 0, 0);
 	input_set_abs_params(imu, ABS_Y, -32768, 32767, 0, 0);
 	input_set_abs_params(imu, ABS_Z, -32768, 32767, 0, 0);
 	input_abs_set_res(imu, ABS_X, SW2_IMU_ACCEL_RES_PER_G);
 	input_abs_set_res(imu, ABS_Y, SW2_IMU_ACCEL_RES_PER_G);
 	input_abs_set_res(imu, ABS_Z, SW2_IMU_ACCEL_RES_PER_G);
-	/* gyroscope (deg/s) */
-	input_set_abs_params(imu, ABS_RX, -32768, 32767, 0, 0);
-	input_set_abs_params(imu, ABS_RY, -32768, 32767, 0, 0);
-	input_set_abs_params(imu, ABS_RZ, -32768, 32767, 0, 0);
-	input_abs_set_res(imu, ABS_RX, SW2_IMU_GYRO_RES_PER_DPS);
-	input_abs_set_res(imu, ABS_RY, SW2_IMU_GYRO_RES_PER_DPS);
-	input_abs_set_res(imu, ABS_RZ, SW2_IMU_GYRO_RES_PER_DPS);
 	input_set_capability(imu, EV_MSC, MSC_TIMESTAMP);
 	__set_bit(INPUT_PROP_ACCELEROMETER, imu->propbit);
 

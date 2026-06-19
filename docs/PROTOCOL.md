@@ -164,28 +164,36 @@ Capture uses `BTN_SELECT` (no Minus to collide with).
 Two 12-bit values packed into 3 bytes:
 `x = b0 | ((b1 & 0x0f) << 8)`, `y = (b1 >> 4) | (b2 << 4)`. Center ≈ 2048.
 
-### IMU (motion)
+### IMU (accelerometer; gyro NOT decoded)
 
-One sample per report: six s16 values **interleaved per axis** —
-`gyroX, accelX, gyroY, accelY, gyroZ, accelZ`.
+One sample per report. The accelerometer is three s16 LE values at the IMU
+offset + 2/6/10 (X/Y/Z):
 
-| Controller | report | IMU offset |
+| Controller | report | IMU offset (accel at +2/+6/+10) |
 |---|---|---|
 | Pro / GameCube / Joy-Con L | 0x09 / 0x0a / 0x07 | 32 |
 | Joy-Con R | 0x08 | 33 |
 
-Accelerometer rests at |a| ≈ 4096 LSB/g. Axis assignment (from a rotation
-sweep): pitch→gyroX, roll→gyroY, yaw→gyroZ, with each gyro axis paired to the
-same-axis accel.
+Accelerometer is **confirmed**: rests at gravity (|a| ≈ 4096 LSB/g, ~4096 on the
+down axis, ~0 on the others). The driver reports raw s16 with resolution 4096
+LSB/g and `INPUT_PROP_ACCELEROMETER`.
 
-Accel resolution is confirmed ~4096 LSB/g (rest |a| ≈ 4096). The driver reports
-the **raw** 16-bit samples, so the gyro resolution is the raw sensitivity
-(~14 LSB/°·s, matching the original Switch — note hid-nintendo's 14247 is that
-value pre-scaled by 1000, which must not be copied for raw samples). The exact
-Switch 2 gyro scale and the per-axis **signs** are still unconfirmed — a
-controlled known-angle, non-saturating rotation capture is needed (the existing
-sweeps saturate the gyro and are corrupted by linear acceleration, so they can't
-be used to fit the scale).
+**Gyro is not decoded.** The three s16 slots interleaved with the accel (IMU
+offset + 0/4/8) look like a gyro by position but are noise over USB at our
+config: held perfectly still they swing ±18000 and flip sign every sample
+(lag-1 autocorrelation ≈ 0, versus ≈ 1.0 for the real accel), and they don't
+correlate with the accel-derived rotation rate. The only other smooth fields in
+the report (s16 at 22/26/30) are non-zero at rest, respond to *all* rotations,
+and have non-constant magnitude — a fused/derived field, not a clean gyro or
+magnetometer.
+
+For reference, the BLE projects (`switch2-controllers`) store accel then gyro as
+**three consecutive** s16 each (BLE offsets 48–53, 54–59) after enabling
+`FEATURE_MOTION (0x04)` — the same flag we set. But our USB layout differs
+(accel is stride-4, and BLE offsets 48–59 are zero in our USB report), so those
+offsets don't map. Recovering a USB gyro likely needs further RE (e.g. SPI
+calibration load, a different or additional enable, or a different decode) plus a
+clean slow non-saturating capture. Until then the driver ships accel-only.
 
 ## 4. Battery
 
