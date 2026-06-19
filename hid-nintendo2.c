@@ -113,10 +113,14 @@
 /* Accelerometer resolution: ~4096 LSB per g (rest |a| measured ~4096). */
 #define SW2_IMU_ACCEL_RES_PER_G	4096
 /*
- * Gyro resolution in LSB per degree/s. Not yet measured for the Switch 2;
- * reuse the original Switch value as a placeholder until calibrated.
+ * Gyro resolution in LSB per degree/s. We report the raw 16-bit sample, so this
+ * is the raw sensitivity. The original Switch's is ~14.247 LSB/dps (the in-tree
+ * hid-nintendo's 14247 is that value pre-scaled by 1000 because it scales the
+ * reported values up by 1000 - we do not, so we must not copy 14247). Rounded
+ * to an integer; still an estimate, pending a controlled known-angle capture to
+ * confirm the Switch 2 value.
  */
-#define SW2_IMU_GYRO_RES_PER_DPS	14247
+#define SW2_IMU_GYRO_RES_PER_DPS	14
 
 /* Command-frame fields shared by the LED command and the GameCube rumble report. */
 #define SW2_CMD_SET_LED		0x09

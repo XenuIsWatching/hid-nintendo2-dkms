@@ -176,8 +176,16 @@ One sample per report: six s16 values **interleaved per axis** —
 
 Accelerometer rests at |a| ≈ 4096 LSB/g. Axis assignment (from a rotation
 sweep): pitch→gyroX, roll→gyroY, yaw→gyroZ, with each gyro axis paired to the
-same-axis accel. Per-axis **signs** and the exact **gyro deg/s scale** are not
-yet calibrated (gyro resolution currently borrows the original Switch value).
+same-axis accel.
+
+Accel resolution is confirmed ~4096 LSB/g (rest |a| ≈ 4096). The driver reports
+the **raw** 16-bit samples, so the gyro resolution is the raw sensitivity
+(~14 LSB/°·s, matching the original Switch — note hid-nintendo's 14247 is that
+value pre-scaled by 1000, which must not be copied for raw samples). The exact
+Switch 2 gyro scale and the per-axis **signs** are still unconfirmed — a
+controlled known-angle, non-saturating rotation capture is needed (the existing
+sweeps saturate the gyro and are corrupted by linear acceleration, so they can't
+be used to fit the scale).
 
 ## 4. Battery
 
