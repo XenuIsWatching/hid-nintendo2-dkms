@@ -195,7 +195,9 @@ is not implemented over USB.
 - The pre-IMU bytes ~20..31 (frame counter + inactive feature slots) are only
   partially identified.
 - Joy-Con SL/SR button bits (9/10) are unverified guesses.
-- Charging-grip GL/GR buttons: the grip (`0x2068`) is a pure USB hub (no HID
-  interface of its own), and pressing GL produced no bit change in the Joy-Con
-  reports. Where GL/GR are exposed (a Joy-Con report field only set when grip-
-  attached, or only over Bluetooth) is unknown.
+- Charging-grip GL/GR buttons: **appear absent from the USB data path.** The
+  grip (`0x2068`) is a pure USB hub; with a Joy-Con attached, pressing GL/GR
+  produced no change anywhere in the Joy-Con's report (button field constant, no
+  alternate report ID, only motion noise on the IMU bytes). BlueRetro has no
+  GL/GR handling either. Likely Bluetooth-only or requires a feature flag we
+  don't set (init enables `0x27`; untried bits `0x08`/`0x40`).
