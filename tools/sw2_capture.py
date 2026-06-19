@@ -408,37 +408,59 @@ def find_analog(hf, log):
 
 def gyro_cal(hf, log, pid):
     """
-    Estimate the gyro scale (LSB per deg/s). Rotate the controller slowly (so it
-    never saturates) through whole 360-degree turns about ONE axis in a single
-    direction; then scale = |integral| / (turns * 360).
+    Estimate the gyro scale (LSB per deg/s). Rotate the controller SLOWLY (so it
+    never saturates) about ONE axis, same direction, through several full turns.
+    Prefer pitch or roll: gravity then sweeps too, so the accelerometer measures
+    the true angle and the scale is computed automatically. (Yaw keeps gravity on
+    one axis, so for yaw fall back to scale = |integral| / (full_turns * 360).)
     """
+    import math
     imu_off = 33 if pid == 0x2066 else 32
-    axes = (("X(pitch)", imu_off), ("Y(roll)", imu_off + 4), ("Z(yaw)", imu_off + 8))
+    g = {"X": imu_off, "Y": imu_off + 4, "Z": imu_off + 8}
+    a = {"X": imu_off + 2, "Y": imu_off + 6, "Z": imu_off + 10}
     dt = 0.004  # 250 Hz
-    sums = [0.0, 0.0, 0.0]
-    sat = 0
-    n = 0
-    print("Rotate SLOWLY through whole 360 turns about ONE axis, same direction\n"
-          "(do not let it saturate). Ctrl-C when done.\n")
+    sums = {"X": 0.0, "Y": 0.0, "Z": 0.0}
+    pitch = roll = 0.0          # accel-derived swept angle (deg)
+    pp = pr = None
+    sat = n = 0
+    print("Rotate SLOWLY (a full turn ~2-3s) about ONE axis, same direction,\n"
+          "through several full turns. Prefer a roll or pitch. Ctrl-C when done.\n")
     try:
         while True:
             d = os.read(hf, 64)
             log.write(d.hex() + "\n")
-            for k, (_, off) in enumerate(axes):
-                v = s16le(d, off)
-                sums[k] += v
+            for ax in "XYZ":
+                v = s16le(d, g[ax])
+                sums[ax] += v
                 if abs(v) > 32000:
                     sat += 1
+            ap = math.degrees(math.atan2(s16le(d, a["Y"]), s16le(d, a["Z"])))
+            ar = math.degrees(math.atan2(s16le(d, a["X"]), s16le(d, a["Z"])))
+            if pp is not None:
+                pitch += (ap - pp + 180) % 360 - 180
+                roll += (ar - pr + 180) % 360 - 180
+            pp, pr = ap, ar
             n += 1
     except KeyboardInterrupt:
         pass
+
+    dom = max("XYZ", key=lambda ax: abs(sums[ax]))
     print(f"\nsamples={n}  saturated_reads={sat}"
-          f"{'   *** SATURATED: rotate slower ***' if sat else ''}")
-    for k, (name, _) in enumerate(axes):
-        integ = sums[k] * dt          # = scale * total_angle_degrees
-        print(f"  gyro {name}: integral={integ:12.1f}  "
-              f"-> scale = {abs(integ):.1f} / (turns*360) LSB/(deg/s)")
-    print("\nDivide the dominant axis's integral by (full_turns * 360).")
+          f"{'   *** SATURATED: rotate much slower and redo ***' if sat else ''}")
+    for ax in "XYZ":
+        print(f"  gyro {ax}: integral(sum*dt)={sums[ax] * dt:11.1f}")
+    print(f"  accel swept: pitch={pitch:.0f} deg, roll={roll:.0f} deg")
+    print(f"  dominant gyro axis: {dom}")
+
+    angle = pitch if dom == "X" else roll if dom == "Y" else 0.0
+    if sat:
+        print("\nResult unreliable (saturated). Rotate slower and redo.")
+    elif dom in "XY" and abs(angle) > 180:
+        print(f"\n==> gyro scale ~= {abs(sums[dom] * dt / angle):.2f} LSB/(deg/s)"
+              f"   (axis {dom}, {abs(angle):.0f} deg swept)")
+    else:
+        print("\nCouldn't auto-derive (yaw, or too little clean rotation).\n"
+              "For yaw: scale = |dominant integral| / (full_turns * 360).")
 
 
 def monitor_buttons(hf, log, pid):

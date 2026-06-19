@@ -18,3 +18,7 @@ Module.symvers
 __pycache__/
 *.pyc
 .checkpatch-camelcase*
+
+# capture logs
+capture-*.log
+usbmon-*.txt

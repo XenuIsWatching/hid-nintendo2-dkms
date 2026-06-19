@@ -65,10 +65,13 @@ Estimate the gyro resolution (LSB per deg/s):
 sudo ./sw2_capture.py --pid 0x2069 --gyrocal
 ```
 
-Rotate the controller **slowly** (so it never saturates) through whole 360°
-turns about **one** axis, in a single direction; Ctrl-C when done. The tool
-prints each axis's integral; divide the dominant one by `full_turns * 360` to
-get the scale, and put it in `SW2_IMU_GYRO_RES_PER_DPS`.
+Rotate the controller **slowly** (a full turn taking ~2–3 s, so it never
+saturates), about **one** axis, in a **single direction**, through several full
+turns; Ctrl-C when done. Prefer a **roll or pitch** — gravity then sweeps too,
+so the tool measures the true angle from the accelerometer and prints the scale
+directly (no turn-counting). For **yaw**, count full turns and use
+`scale = |integral| / (full_turns * 360)`. Put the result in
+`SW2_IMU_GYRO_RES_PER_DPS`. If it reports `SATURATED`, rotate much slower.
 
 ## IMU discovery mode
 
