@@ -148,9 +148,13 @@
 
 #define SW2_STICK_CENTER	2048	/* 12-bit stick midpoint */
 #define SW2_STICK_MAX		4095
-/* GameCube analog triggers report roughly 0x24..0xf0; remap to 0..255. */
+/*
+ * GameCube analog triggers (report bytes 13/14, L/R). Measured: released rests
+ * at ~0x1f-0x21, fully pulled ~0xea. Remap that span to 0..255 (the rest values
+ * sit below MIN, so a released trigger clamps cleanly to 0).
+ */
 #define SW2_TRIGGER_RAW_MIN	0x24
-#define SW2_TRIGGER_RAW_MAX	0xf0
+#define SW2_TRIGGER_RAW_MAX	0xea
 
 enum sw2_ctlr_type {
 	SW2_CTLR_PROCON,
