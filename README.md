@@ -103,9 +103,8 @@ fields, cycle the LEDs, and test rumble. See [`tools/README.md`](tools/README.md
 
 ## Credits / references
 
-Original `hid-nintendo` authors: Daniel J. Ogorchock, Nadia Holmquist Pedersen,
-Emily Strickland, Ryan McClelland. Protocol reverse-engineering references (used
-for byte sequences / report layouts only; the code here is original):
+Protocol reverse-engineering references (used for byte sequences / report
+layouts only; the code here is original):
 
 - https://github.com/ikz87/NSW2-controller-enabler
 - https://github.com/loserkidsblink/nsogcd
