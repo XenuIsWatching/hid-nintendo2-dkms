@@ -365,6 +365,82 @@ def find_button(hf, log):
         print("\nStopped.")
 
 
+def find_analog(hf, log):
+    """
+    Find analog inputs (e.g. the GameCube L/R triggers) by the byte range
+    growing when you work the control. Records a hands-off baseline (so the
+    always-noisy counter/IMU bytes are discounted), then reports bytes whose
+    value range expands during the pull.
+    """
+    bmin = [255] * 64
+    bmax = [0] * 64
+    print("Baseline: keep hands OFF everything (incl. sticks/triggers) ~3s...")
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 3.0:
+        d = os.read(hf, 64)
+        log.write(d.hex() + "\n")
+        for i in range(min(len(d), 64)):
+            bmin[i] = min(bmin[i], d[i])
+            bmax[i] = max(bmax[i], d[i])
+    base_rng = [bmax[i] - bmin[i] for i in range(64)]
+    pmin = [255] * 64
+    pmax = [0] * 64
+    print("\nNow slowly pull L fully, release, then R fully. Ctrl-C to stop.\n")
+    try:
+        while True:
+            d = os.read(hf, 64)
+            log.write(d.hex() + "\n")
+            for i in range(min(len(d), 64)):
+                pmin[i] = min(pmin[i], d[i])
+                pmax[i] = max(pmax[i], d[i])
+    except KeyboardInterrupt:
+        pass
+    print("\nbytes whose range grew during the pull (analog candidates):")
+    found = False
+    for i in range(64):
+        if (pmax[i] - pmin[i]) - base_rng[i] >= 24:
+            print(f"  byte {i:2d}: rest {bmin[i]:3d}..{bmax[i]:3d}  "
+                  f"pulled {pmin[i]:3d}..{pmax[i]:3d}")
+            found = True
+    if not found:
+        print("  (none found)")
+
+
+def gyro_cal(hf, log, pid):
+    """
+    Estimate the gyro scale (LSB per deg/s). Rotate the controller slowly (so it
+    never saturates) through whole 360-degree turns about ONE axis in a single
+    direction; then scale = |integral| / (turns * 360).
+    """
+    imu_off = 33 if pid == 0x2066 else 32
+    axes = (("X(pitch)", imu_off), ("Y(roll)", imu_off + 4), ("Z(yaw)", imu_off + 8))
+    dt = 0.004  # 250 Hz
+    sums = [0.0, 0.0, 0.0]
+    sat = 0
+    n = 0
+    print("Rotate SLOWLY through whole 360 turns about ONE axis, same direction\n"
+          "(do not let it saturate). Ctrl-C when done.\n")
+    try:
+        while True:
+            d = os.read(hf, 64)
+            log.write(d.hex() + "\n")
+            for k, (_, off) in enumerate(axes):
+                v = s16le(d, off)
+                sums[k] += v
+                if abs(v) > 32000:
+                    sat += 1
+            n += 1
+    except KeyboardInterrupt:
+        pass
+    print(f"\nsamples={n}  saturated_reads={sat}"
+          f"{'   *** SATURATED: rotate slower ***' if sat else ''}")
+    for k, (name, _) in enumerate(axes):
+        integ = sums[k] * dt          # = scale * total_angle_degrees
+        print(f"  gyro {name}: integral={integ:12.1f}  "
+              f"-> scale = {abs(integ):.1f} / (turns*360) LSB/(deg/s)")
+    print("\nDivide the dominant axis's integral by (full_turns * 360).")
+
+
 def monitor_buttons(hf, log, pid):
     """Stream input reports and print which button bits change."""
     print("Press buttons one at a time. Ctrl-C to stop.\n")
@@ -466,6 +542,10 @@ def main():
                     help="test rumble framing variants and exit")
     ap.add_argument("--findbtn", action="store_true",
                     help="find which report byte a button toggles (e.g. GL/GR)")
+    ap.add_argument("--triggers", action="store_true",
+                    help="find analog inputs (e.g. GameCube L/R triggers)")
+    ap.add_argument("--gyrocal", action="store_true",
+                    help="estimate the gyro scale from known 360-degree turns")
     args = ap.parse_args()
     pid = int(args.pid, 0)
 
@@ -522,14 +602,19 @@ def main():
         return 1
     print(f"Reading from {hidraw}")
 
-    mode = "findbtn" if args.findbtn else "imu" if args.imu else "buttons"
+    mode = ("gyrocal" if args.gyrocal else "triggers" if args.triggers else
+            "findbtn" if args.findbtn else "imu" if args.imu else "buttons")
     logname = f"capture-{pid:04x}-{mode}-{int(time.time())}.log"
     log = open(logname, "w")
     print(f"Logging raw reports to {logname}\n")
 
     hf = os.open(hidraw, os.O_RDONLY)
     try:
-        if args.findbtn:
+        if args.gyrocal:
+            gyro_cal(hf, log, pid)
+        elif args.triggers:
+            find_analog(hf, log)
+        elif args.findbtn:
             find_button(hf, log)
         elif args.imu:
             monitor_imu(hf, log, pid)

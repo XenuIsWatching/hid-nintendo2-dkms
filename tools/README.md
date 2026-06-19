@@ -44,6 +44,32 @@ sudo ./sw2_capture.py --pid 0x2066 --findbtn   # right Joy-Con (GR)
 
 Keep hands off for the ~3s baseline, then press/hold the button.
 
+## Find analog inputs (e.g. GameCube L/R triggers)
+
+Records a hands-off baseline, then reports bytes whose value range grows as you
+work an analog control:
+
+```bash
+sudo ./sw2_capture.py --pid 0x2073 --triggers
+```
+
+Keep hands off for the ~3s baseline, then slowly pull L fully, release, pull R.
+(The GameCube triggers are already mapped at report bytes 13/14 → ABS_Z/ABS_RZ;
+this confirms the bytes and the L-vs-R assignment.)
+
+## Gyro scale calibration
+
+Estimate the gyro resolution (LSB per deg/s):
+
+```bash
+sudo ./sw2_capture.py --pid 0x2069 --gyrocal
+```
+
+Rotate the controller **slowly** (so it never saturates) through whole 360°
+turns about **one** axis, in a single direction; Ctrl-C when done. The tool
+prints each axis's integral; divide the dominant one by `full_turns * 360` to
+get the scale, and put it in `SW2_IMU_GYRO_RES_PER_DPS`.
+
 ## IMU discovery mode
 
 Finds the gyro/accelerometer fields in the report:
