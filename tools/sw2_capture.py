@@ -327,6 +327,44 @@ def s16le(d, off):
     return int.from_bytes(d[off:off + 2], "little", signed=True)
 
 
+def find_button(hf, log):
+    """
+    Find which report byte/bit a button toggles, including ones outside the
+    normal button field (e.g. the charging-grip GL/GR). First records a baseline
+    with nothing pressed (to learn which bytes are constantly changing, such as
+    the counter/timestamp/IMU), then flags any *stable* byte that changes.
+    """
+    import collections
+    counts = [collections.Counter() for _ in range(64)]
+    print("Baseline: keep hands OFF all buttons/sticks for ~3s...")
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 3.0:
+        d = os.read(hf, 64)
+        log.write(d.hex() + "\n")
+        for i in range(min(len(d), 64)):
+            counts[i][d[i]] += 1
+    # Bytes with few distinct baseline values are "stable" (candidate buttons).
+    rest = {i: c.most_common(1)[0][0]
+            for i, c in enumerate(counts) if c and len(c) <= 3}
+    dynamic = [i for i in range(64) if i not in rest]
+    print(f"stable bytes: {sorted(rest)}")
+    print(f"(ignoring dynamic bytes: {dynamic})")
+    print("\nNow press/HOLD the button (e.g. GL or GR) a few times. Ctrl-C to "
+          "stop.\n")
+    seen = set()
+    try:
+        while True:
+            d = os.read(hf, 64)
+            log.write(d.hex() + "\n")
+            for i, base in rest.items():
+                if i < len(d) and d[i] != base and (i, d[i]) not in seen:
+                    seen.add((i, d[i]))
+                    print(f"  byte {i:2d}: 0x{base:02x} -> 0x{d[i]:02x}  "
+                          f"(changed bits: {base ^ d[i]:08b})")
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+
 def monitor_buttons(hf, log, pid):
     """Stream input reports and print which button bits change."""
     print("Press buttons one at a time. Ctrl-C to stop.\n")
@@ -426,6 +464,8 @@ def main():
                     help="cycle the player 1..8 LED patterns and exit")
     ap.add_argument("--rumble", action="store_true",
                     help="test rumble framing variants and exit")
+    ap.add_argument("--findbtn", action="store_true",
+                    help="find which report byte a button toggles (e.g. GL/GR)")
     args = ap.parse_args()
     pid = int(args.pid, 0)
 
@@ -482,14 +522,16 @@ def main():
         return 1
     print(f"Reading from {hidraw}")
 
-    mode = "imu" if args.imu else "buttons"
+    mode = "findbtn" if args.findbtn else "imu" if args.imu else "buttons"
     logname = f"capture-{pid:04x}-{mode}-{int(time.time())}.log"
     log = open(logname, "w")
     print(f"Logging raw reports to {logname}\n")
 
     hf = os.open(hidraw, os.O_RDONLY)
     try:
-        if args.imu:
+        if args.findbtn:
+            find_button(hf, log)
+        elif args.imu:
             monitor_imu(hf, log, pid)
         else:
             try:

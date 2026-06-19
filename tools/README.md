@@ -32,6 +32,18 @@ These scripts send that handshake, then decode the resulting reports.
 4. Hand the bit list back to update the button maps in `hid-nintendo2.c`
    (`sw2_procon_btns`, `sw2_joyconl_btns`, etc.).
 
+## Find a button's report byte (e.g. charging-grip GL/GR)
+
+For buttons that aren't in the normal button field, this records a hands-off
+baseline, then flags any *stable* byte that changes when you press the button:
+
+```bash
+sudo ./sw2_capture.py --pid 0x2067 --findbtn   # left Joy-Con (GL)
+sudo ./sw2_capture.py --pid 0x2066 --findbtn   # right Joy-Con (GR)
+```
+
+Keep hands off for the ~3s baseline, then press/hold the button.
+
 ## IMU discovery mode
 
 Finds the gyro/accelerometer fields in the report:
