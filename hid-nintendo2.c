@@ -44,6 +44,7 @@
 #include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/unaligned.h>
 #include <linux/usb.h>
 #include <linux/workqueue.h>
 
@@ -117,6 +118,12 @@
  */
 #define SW2_IMU_GYRO_RES_PER_DPS	14247
 
+/* Command-frame fields shared by the LED command and the GameCube rumble report. */
+#define SW2_CMD_SET_LED		0x09
+#define SW2_REQ_TYPE_REQ	0x91
+#define SW2_IFACE_USB		0x00
+#define SW2_SUBCMD_SET_LED	0x07
+
 /* Player LEDs: vendor command 0x09, subcommand 0x07, bitmask at payload byte. */
 #define SW2_NUM_PLAYER_LEDS	4
 #define SW2_NUM_LED_PATTERNS	8
@@ -154,8 +161,7 @@ struct sw2_ctlr {
 	struct input_dev *imu_input;
 	struct usb_device *udev;
 	enum sw2_ctlr_type type;
-	u8 input_report_id;
-	u8 imu_offset;		/* report offset of IMU sample, 0 if none */
+	const struct sw2_ctlr_info *info;	/* per-type parameters */
 	unsigned int ep_out;	/* bulk OUT pipe on the vendor interface */
 	unsigned int ep_in;	/* bulk IN pipe on the vendor interface */
 	struct mutex out_mutex;	/* serializes vendor OUT transfers */
@@ -164,8 +170,6 @@ struct sw2_ctlr {
 	int player_id;		/* assigned player number, -1 if none */
 	ktime_t imu_last;	/* time of previous IMU sample */
 	u32 imu_timestamp_us;	/* accumulated IMU timestamp (MSC_TIMESTAMP) */
-	u8 out_report_id;	/* HID output report ID for rumble */
-	bool has_rumble;
 	struct delayed_work rumble_work;
 	spinlock_t rumble_lock;	/* protects the fields below */
 	u16 rumble_lf;		/* low-freq amplitude */
@@ -293,6 +297,46 @@ static const struct sw2_button_map sw2_joyconr_btns[] = {
 	{ }
 };
 
+/* Per-controller-type parameters, indexed by enum sw2_ctlr_type. */
+struct sw2_ctlr_info {
+	u8 input_report_id;
+	u8 out_report_id;		/* HID output report ID for rumble */
+	u8 imu_offset;			/* report offset of the IMU sample */
+	bool has_right_stick;
+	bool has_triggers;
+	const struct sw2_button_map *buttons;
+};
+
+static const struct sw2_ctlr_info sw2_ctlr_infos[] = {
+	[SW2_CTLR_PROCON] = {
+		.input_report_id = SW2_INPUT_REPORT_PROCON,
+		.out_report_id	 = 0x02,
+		.imu_offset	 = SW2_OFF_IMU,
+		.has_right_stick = true,
+		.buttons	 = sw2_procon_btns,
+	},
+	[SW2_CTLR_JOYCONL] = {
+		.input_report_id = SW2_INPUT_REPORT_JOYCONL,
+		.out_report_id	 = 0x01,
+		.imu_offset	 = SW2_OFF_IMU,
+		.buttons	 = sw2_joyconl_btns,
+	},
+	[SW2_CTLR_JOYCONR] = {
+		.input_report_id = SW2_INPUT_REPORT_JOYCONR,
+		.out_report_id	 = 0x01,
+		.imu_offset	 = SW2_OFF_IMU_JOYCONR,
+		.buttons	 = sw2_joyconr_btns,
+	},
+	[SW2_CTLR_NSOGC] = {
+		.input_report_id = SW2_INPUT_REPORT_NSOGC,
+		.out_report_id	 = 0x03,
+		.imu_offset	 = SW2_OFF_IMU,
+		.has_right_stick = true,
+		.has_triggers	 = true,
+		.buttons	 = sw2_nsogc_btns,
+	},
+};
+
 /*
  * Proprietary USB initialization sequence, sent to the vendor interface's bulk
  * OUT endpoint. Derived from the NSW2-controller-enabler project; several
@@ -341,36 +385,11 @@ static const struct sw2_init_cmd sw2_init_seq[] = {
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00),
 };
 
-static const struct sw2_button_map *sw2_button_map_for(enum sw2_ctlr_type type)
-{
-	switch (type) {
-	case SW2_CTLR_NSOGC:
-		return sw2_nsogc_btns;
-	case SW2_CTLR_JOYCONL:
-		return sw2_joyconl_btns;
-	case SW2_CTLR_JOYCONR:
-		return sw2_joyconr_btns;
-	case SW2_CTLR_PROCON:
-	default:
-		return sw2_procon_btns;
-	}
-}
-
-static bool sw2_has_right_stick(enum sw2_ctlr_type type)
-{
-	return type == SW2_CTLR_PROCON || type == SW2_CTLR_NSOGC;
-}
-
-static bool sw2_has_triggers(enum sw2_ctlr_type type)
-{
-	return type == SW2_CTLR_NSOGC;
-}
-
 /* Unpack two 12-bit little-endian values from three bytes. */
 static void sw2_unpack_stick(const u8 *d, u16 *x, u16 *y)
 {
-	*x = d[0] | ((d[1] & 0x0f) << 8);
-	*y = (d[1] >> 4) | (d[2] << 4);
+	*x = get_unaligned_le16(d) & 0x0fff;
+	*y = get_unaligned_le16(d + 1) >> 4;
 }
 
 static int sw2_remap_trigger(u8 raw)
@@ -442,7 +461,8 @@ out:
 /* Set the four player-indicator LEDs from a bitmask (bit 0 = LED 1). */
 static int sw2_set_player_leds(struct sw2_ctlr *ctlr, u8 mask)
 {
-	u8 cmd[16] = { 0x09, 0x91, 0x00, 0x07, 0x00, 0x08, 0x00, 0x00, mask };
+	u8 cmd[16] = { SW2_CMD_SET_LED, SW2_REQ_TYPE_REQ, SW2_IFACE_USB,
+		       SW2_SUBCMD_SET_LED, 0x00, 0x08, 0x00, 0x00, mask };
 	u8 *buf;
 	int ret, actual;
 
@@ -528,11 +548,8 @@ static void sw2_vib_frame(u8 *p, u16 lf_amp, u16 hf_amp)
 	v |= (u64)(lf_amp & 0x3ff) << 10;
 	v |= (u64)(SW2_VIB_HF_FREQ & 0x1ff) << 20;
 	v |= (u64)(hf_amp & 0x3ff) << 30;
-	p[0] = v;
-	p[1] = v >> 8;
-	p[2] = v >> 16;
-	p[3] = v >> 24;
-	p[4] = v >> 32;
+	put_unaligned_le32((u32)v, p);	/* low 32 bits */
+	p[4] = v >> 32;			/* high 8 bits */
 }
 
 /* Build and send the current rumble state as a HID output report. */
@@ -548,7 +565,7 @@ static void sw2_send_rumble(struct sw2_ctlr *ctlr)
 	hf = ctlr->rumble_hf;
 	spin_unlock_irqrestore(&ctlr->rumble_lock, flags);
 
-	buf[pos++] = ctlr->out_report_id;
+	buf[pos++] = ctlr->info->out_report_id;
 
 	if (ctlr->type == SW2_CTLR_NSOGC) {
 		/*
@@ -558,10 +575,10 @@ static void sw2_send_rumble(struct sw2_ctlr *ctlr)
 		 */
 		buf[1] = 0x50 | (ctlr->rumble_pkt_id & 0x0f);
 		buf[2] = (lf || hf) ? 0x01 : 0x00;
-		buf[5] = 0x09;	/* CMD_SET_LED */
-		buf[6] = 0x91;	/* REQ */
-		buf[7] = 0x00;	/* interface = USB */
-		buf[8] = 0x07;	/* SUBCMD_SET_LED */
+		buf[5] = SW2_CMD_SET_LED;
+		buf[6] = SW2_REQ_TYPE_REQ;
+		buf[7] = SW2_IFACE_USB;
+		buf[8] = SW2_SUBCMD_SET_LED;
 		buf[10] = 0x08;
 		buf[13] = ctlr->led_mask;
 	} else {
@@ -624,10 +641,8 @@ static int sw2_play_effect(struct input_dev *dev, void *data,
 
 static void sw2_report_buttons(struct sw2_ctlr *ctlr, const u8 *data)
 {
-	const struct sw2_button_map *map = sw2_button_map_for(ctlr->type);
-	u32 buttons = data[SW2_OFF_BUTTONS] |
-		      (data[SW2_OFF_BUTTONS + 1] << 8) |
-		      (data[SW2_OFF_BUTTONS + 2] << 16);
+	const struct sw2_button_map *map = ctlr->info->buttons;
+	u32 buttons = get_unaligned_le24(&data[SW2_OFF_BUTTONS]);
 
 	for (; map->code; map++)
 		input_report_key(ctlr->input, map->code,
@@ -642,34 +657,29 @@ static void sw2_report_sticks(struct sw2_ctlr *ctlr, const u8 *data)
 	input_report_abs(ctlr->input, ABS_X, x);
 	input_report_abs(ctlr->input, ABS_Y, SW2_STICK_MAX - y);
 
-	if (sw2_has_right_stick(ctlr->type)) {
+	if (ctlr->info->has_right_stick) {
 		sw2_unpack_stick(&data[SW2_OFF_STICK_R], &x, &y);
 		input_report_abs(ctlr->input, ABS_RX, x);
 		input_report_abs(ctlr->input, ABS_RY, SW2_STICK_MAX - y);
 	}
 }
 
-static s16 sw2_s16le(const u8 *p)
-{
-	return (s16)(p[0] | (p[1] << 8));
-}
-
 /*
  * Report the IMU sample. The six s16 values are interleaved per axis as
- * gyro,accel for X, then Y, then Z, starting at ctlr->imu_offset. Gyro is
- * reported on ABS_R[XYZ], accel on ABS_[XYZ], on a separate input device.
+ * gyro,accel for X, then Y, then Z, starting at the controller's IMU offset.
+ * Gyro is reported on ABS_R[XYZ], accel on ABS_[XYZ], on a separate input dev.
  */
 static void sw2_report_imu(struct sw2_ctlr *ctlr, const u8 *data)
 {
-	const u8 *p = data + ctlr->imu_offset;
+	const u8 *p = data + ctlr->info->imu_offset;
 	ktime_t now = ktime_get();
 
-	input_report_abs(ctlr->imu_input, ABS_RX, sw2_s16le(p + 0));  /* gyro X */
-	input_report_abs(ctlr->imu_input, ABS_X,  sw2_s16le(p + 2));  /* acc X */
-	input_report_abs(ctlr->imu_input, ABS_RY, sw2_s16le(p + 4));  /* gyro Y */
-	input_report_abs(ctlr->imu_input, ABS_Y,  sw2_s16le(p + 6));  /* acc Y */
-	input_report_abs(ctlr->imu_input, ABS_RZ, sw2_s16le(p + 8));  /* gyro Z */
-	input_report_abs(ctlr->imu_input, ABS_Z,  sw2_s16le(p + 10)); /* acc Z */
+	input_report_abs(ctlr->imu_input, ABS_RX, (s16)get_unaligned_le16(p + 0));
+	input_report_abs(ctlr->imu_input, ABS_X,  (s16)get_unaligned_le16(p + 2));
+	input_report_abs(ctlr->imu_input, ABS_RY, (s16)get_unaligned_le16(p + 4));
+	input_report_abs(ctlr->imu_input, ABS_Y,  (s16)get_unaligned_le16(p + 6));
+	input_report_abs(ctlr->imu_input, ABS_RZ, (s16)get_unaligned_le16(p + 8));
+	input_report_abs(ctlr->imu_input, ABS_Z,  (s16)get_unaligned_le16(p + 10));
 
 	/*
 	 * Report a monotonic microsecond timestamp accumulated from the
@@ -694,13 +704,13 @@ static int sw2_hid_event(struct hid_device *hdev, struct hid_report *report,
 
 	if (!ctlr || !ctlr->input)
 		return 0;
-	if (size < SW2_OFF_STICK_R + 3 || data[0] != ctlr->input_report_id)
+	if (size < SW2_OFF_STICK_R + 3 || data[0] != ctlr->info->input_report_id)
 		return 0;
 
 	sw2_report_buttons(ctlr, data);
 	sw2_report_sticks(ctlr, data);
 
-	if (sw2_has_triggers(ctlr->type)) {
+	if (ctlr->info->has_triggers) {
 		input_report_abs(ctlr->input, ABS_Z,
 				 sw2_remap_trigger(data[SW2_OFF_TRIGGER_L]));
 		input_report_abs(ctlr->input, ABS_RZ,
@@ -709,8 +719,8 @@ static int sw2_hid_event(struct hid_device *hdev, struct hid_report *report,
 
 	input_sync(ctlr->input);
 
-	if (ctlr->imu_input && ctlr->imu_offset &&
-	    size >= ctlr->imu_offset + SW2_IMU_LEN)
+	if (ctlr->imu_input &&
+	    size >= ctlr->info->imu_offset + SW2_IMU_LEN)
 		sw2_report_imu(ctlr, data);
 
 	return 0;
@@ -719,8 +729,9 @@ static int sw2_hid_event(struct hid_device *hdev, struct hid_report *report,
 static int sw2_input_create(struct sw2_ctlr *ctlr)
 {
 	struct hid_device *hdev = ctlr->hdev;
-	const struct sw2_button_map *map = sw2_button_map_for(ctlr->type);
+	const struct sw2_button_map *map = ctlr->info->buttons;
 	struct input_dev *input;
+	int ret;
 
 	input = devm_input_allocate_device(&hdev->dev);
 	if (!input)
@@ -738,23 +749,19 @@ static int sw2_input_create(struct sw2_ctlr *ctlr)
 
 	input_set_abs_params(input, ABS_X, 0, SW2_STICK_MAX, 16, 128);
 	input_set_abs_params(input, ABS_Y, 0, SW2_STICK_MAX, 16, 128);
-	if (sw2_has_right_stick(ctlr->type)) {
+	if (ctlr->info->has_right_stick) {
 		input_set_abs_params(input, ABS_RX, 0, SW2_STICK_MAX, 16, 128);
 		input_set_abs_params(input, ABS_RY, 0, SW2_STICK_MAX, 16, 128);
 	}
-	if (sw2_has_triggers(ctlr->type)) {
+	if (ctlr->info->has_triggers) {
 		input_set_abs_params(input, ABS_Z, 0, 255, 0, 0);
 		input_set_abs_params(input, ABS_RZ, 0, 255, 0, 0);
 	}
 
-	if (ctlr->has_rumble) {
-		int ret;
-
-		input_set_capability(input, EV_FF, FF_RUMBLE);
-		ret = input_ff_create_memless(input, NULL, sw2_play_effect);
-		if (ret)
-			return ret;
-	}
+	input_set_capability(input, EV_FF, FF_RUMBLE);
+	ret = input_ff_create_memless(input, NULL, sw2_play_effect);
+	if (ret)
+		return ret;
 
 	ctlr->input = input;
 	return input_register_device(input);
@@ -764,8 +771,6 @@ static int sw2_imu_input_create(struct sw2_ctlr *ctlr)
 {
 	struct hid_device *hdev = ctlr->hdev;
 	struct input_dev *imu;
-	int g = SW2_IMU_GYRO_RES_PER_DPS;
-	int a = SW2_IMU_ACCEL_RES_PER_G;
 
 	imu = devm_input_allocate_device(&hdev->dev);
 	if (!imu)
@@ -784,16 +789,16 @@ static int sw2_imu_input_create(struct sw2_ctlr *ctlr)
 	input_set_abs_params(imu, ABS_X, -32768, 32767, 0, 0);
 	input_set_abs_params(imu, ABS_Y, -32768, 32767, 0, 0);
 	input_set_abs_params(imu, ABS_Z, -32768, 32767, 0, 0);
-	input_abs_set_res(imu, ABS_X, a);
-	input_abs_set_res(imu, ABS_Y, a);
-	input_abs_set_res(imu, ABS_Z, a);
+	input_abs_set_res(imu, ABS_X, SW2_IMU_ACCEL_RES_PER_G);
+	input_abs_set_res(imu, ABS_Y, SW2_IMU_ACCEL_RES_PER_G);
+	input_abs_set_res(imu, ABS_Z, SW2_IMU_ACCEL_RES_PER_G);
 	/* gyroscope (deg/s) */
 	input_set_abs_params(imu, ABS_RX, -32768, 32767, 0, 0);
 	input_set_abs_params(imu, ABS_RY, -32768, 32767, 0, 0);
 	input_set_abs_params(imu, ABS_RZ, -32768, 32767, 0, 0);
-	input_abs_set_res(imu, ABS_RX, g);
-	input_abs_set_res(imu, ABS_RY, g);
-	input_abs_set_res(imu, ABS_RZ, g);
+	input_abs_set_res(imu, ABS_RX, SW2_IMU_GYRO_RES_PER_DPS);
+	input_abs_set_res(imu, ABS_RY, SW2_IMU_GYRO_RES_PER_DPS);
+	input_abs_set_res(imu, ABS_RZ, SW2_IMU_GYRO_RES_PER_DPS);
 	input_set_capability(imu, EV_MSC, MSC_TIMESTAMP);
 	__set_bit(INPUT_PROP_ACCELEROMETER, imu->propbit);
 
@@ -816,13 +821,6 @@ static enum sw2_ctlr_type sw2_type_from_product(__u16 product)
 	}
 }
 
-static const u8 sw2_input_report_ids[] = {
-	[SW2_CTLR_PROCON]  = SW2_INPUT_REPORT_PROCON,
-	[SW2_CTLR_JOYCONL] = SW2_INPUT_REPORT_JOYCONL,
-	[SW2_CTLR_JOYCONR] = SW2_INPUT_REPORT_JOYCONR,
-	[SW2_CTLR_NSOGC]   = SW2_INPUT_REPORT_NSOGC,
-};
-
 static int sw2_hid_probe(struct hid_device *hdev,
 			 const struct hid_device_id *id)
 {
@@ -838,34 +836,9 @@ static int sw2_hid_probe(struct hid_device *hdev,
 	ctlr->player_id = -1;
 	mutex_init(&ctlr->out_mutex);
 	ctlr->type = sw2_type_from_product(id->product);
-	ctlr->input_report_id = sw2_input_report_ids[ctlr->type];
-	/* IMU offset confirmed for all four controllers (R Joy-Con is +1). */
-	if (ctlr->type == SW2_CTLR_JOYCONR)
-		ctlr->imu_offset = SW2_OFF_IMU_JOYCONR;
-	else
-		ctlr->imu_offset = SW2_OFF_IMU;
-
-	/*
-	 * Rumble via HID output report. Report IDs come from the descriptors.
-	 * Pro/Joy-Con use HD haptic frames; the GameCube uses a simple on/off
-	 * report (see sw2_send_rumble). All confirmed by testing.
-	 */
+	ctlr->info = &sw2_ctlr_infos[ctlr->type];
 	spin_lock_init(&ctlr->rumble_lock);
 	INIT_DELAYED_WORK(&ctlr->rumble_work, sw2_rumble_worker);
-	ctlr->has_rumble = true;
-	switch (ctlr->type) {
-	case SW2_CTLR_JOYCONL:
-	case SW2_CTLR_JOYCONR:
-		ctlr->out_report_id = 0x01;
-		break;
-	case SW2_CTLR_NSOGC:
-		ctlr->out_report_id = 0x03;
-		break;
-	case SW2_CTLR_PROCON:
-	default:
-		ctlr->out_report_id = 0x02;
-		break;
-	}
 	hid_set_drvdata(hdev, ctlr);
 
 	ret = hid_parse(hdev);
@@ -894,7 +867,7 @@ static int sw2_hid_probe(struct hid_device *hdev,
 	if (ret)
 		goto err_close;
 
-	if (ctlr->imu_offset) {
+	if (ctlr->info->imu_offset) {
 		ret = sw2_imu_input_create(ctlr);
 		if (ret)
 			goto err_close;
