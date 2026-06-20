@@ -76,6 +76,20 @@ byte 0:
 The driver assigns a unique player number (IDA) and maps it to the standard
 Switch player patterns: P1..P8 = `0x01 0x03 0x07 0x0f 0x09 0x05 0x0d 0x06`.
 
+### SPI flash read `cmd=0x02 sub=0x04`
+
+Per-unit calibration lives in the controller's SPI flash and is read over the
+vendor channel during init. The frame carries a length and a little-endian
+address; the reply echoes a 16-byte header followed by the data payload:
+
+```
+02 91 00 04 00 08 00 00 <len> 7e 00 00 <addr LE32>
+```
+
+Reads of up to ~0x30 bytes per request work. The device-info block at `0x13000`
+holds the ASCII serial, USB VID/PID and colour codes. See "Calibration" below for
+the stick/trigger calibration this is used for.
+
 ### Rumble (HID output report, interface 0)
 
 Rumble does **not** go over the vendor channel — it is a **HID output report**
@@ -110,6 +124,14 @@ weak→hf_amp; GameCube: any nonzero → on) and resends every ~30 ms while acti
 Joy-Con R `0x08`). All multi-byte fields are little-endian. Offsets below are for
 the Pro Controller; the **right Joy-Con shifts the sensor section (offset 15
 onward) by +1 byte** due to an extra reserved byte in the pre-sensor padding.
+
+> A controller that is only *partially* initialized (e.g. sent the wake command
+> but not the full init sequence) streams a different, basic report — observed on
+> the GameCube as report `0x05`, with a different layout (byte 3 constant `0x04`,
+> sticks around bytes 11–16). It is a compatibility/fallback report, not the
+> native one; the full init promotes the controller to the native ID above. The
+> driver matches only the native per-type ID, so a fallback-mode controller
+> simply produces no input events rather than misparsed ones.
 
 ```
 off  size  field
@@ -162,7 +184,34 @@ Capture uses `BTN_SELECT` (no Minus to collide with).
 ### Sticks
 
 Two 12-bit values packed into 3 bytes:
-`x = b0 | ((b1 & 0x0f) << 8)`, `y = (b1 >> 4) | (b2 << 4)`. Center ≈ 2048.
+`x = b0 | ((b1 & 0x0f) << 8)`, `y = (b1 >> 4) | (b2 << 4)`. Raw center ≈ 2048.
+The driver applies per-unit calibration (below) and reports signed axes
+(−32768..32767).
+
+### Calibration (SPI flash)
+
+Read with the SPI command above during init.
+
+**Sticks** — 9-byte blob: three packed (x,y) pairs in the same 12-bit format as
+the stick reports, giving per-axis `neutral` / `positive` span / `negative` span:
+
+| Address | Use |
+|---|---|
+| `0x130a8` | factory primary calibration (left / main stick) |
+| `0x130e8` | factory secondary calibration (right / C stick) |
+| `0x1fc040` | user primary (11 bytes: `a1 b2` magic + 9-byte blob) |
+| `0x1fc080` | user secondary |
+
+User calibration overrides factory when the `0xa1b2` magic is present (axes are
+all `0xff` when unset). Apply: `out = (raw − neutral) * 32768 / span`, choosing
+the positive or negative span by sign; the Y axis is negated. Single-stick
+controllers (Joy-Cons) use the primary slot only.
+
+**GameCube triggers** — 2 bytes at `0x13140` = `[left_zero, right_zero]`, the
+per-unit released rest points (`0xff` = unset). The full-pull value is **not**
+stored and varies by unit (~0xe0), so the driver tracks each trigger's observed
+maximum at runtime (grow-only, seeded below the typical full-pull) and scales
+`out = 4096 * (raw − zero) / (max − zero)` to 0..4095.
 
 ### IMU (accelerometer; gyro NOT decoded)
 

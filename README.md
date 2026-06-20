@@ -22,6 +22,7 @@ waiting for mainline. It is the Switch 2 counterpart to the in-tree
 | Buttons + D-pad | ✅ | ✅ | ✅ |
 | Analog stick(s) | ✅ (2) | ✅ (1) | ✅ (2) |
 | Analog triggers | — | — | ✅ |
+| Per-unit calibration | ✅ | ✅ | ✅ |
 | Accelerometer | ✅ | ✅ | ✅ |
 | Gyroscope | ✘ | ✘ | ✘ |
 | Player LEDs | ✅ | ✅ | ✅ |
@@ -31,6 +32,12 @@ Buttons and sticks are exposed on a standard input device; the accelerometer is
 a separate input device (`ABS_X/Y/Z`, `INPUT_PROP_ACCELEROMETER`,
 `MSC_TIMESTAMP`). Player LEDs appear under `/sys/class/leds` and a unique player
 number is assigned per controller.
+
+Sticks and (GameCube) triggers are calibrated per unit: the driver reads the
+controller's factory calibration from SPI flash — honouring any user calibration
+written via a console — so axes are centred and full-scale without manual tuning.
+Sticks report calibrated signed values (`−32768..32767`); GameCube triggers
+report `0..4095` with the full-pull point auto-calibrated at runtime.
 
 The **gyroscope is not decoded**: the report slots that sit where a gyro would
 go carry only noise over USB at the current config (see `docs/PROTOCOL.md`);

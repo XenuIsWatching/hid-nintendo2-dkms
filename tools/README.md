@@ -143,3 +143,19 @@ Outputs `usbmon-busN-<pid>-<ts>.txt` (raw URBs) plus the decoder log.
   is **0x09**; Joy-Con 2 L/R are **0x07 / 0x08**. Stick data is two 12-bit
   little-endian values per 3 bytes, center 2048. GameCube analog triggers are
   in the vendor bytes at report offsets 13/14.
+
+## SPI flash dump (`spi_dump.py`)
+
+Reads the controller's SPI flash over the vendor interface (the same command the
+driver uses for calibration). Zero-dependency; needs access to the raw USB node
+(root, or the udev rule that grants the `057e:*` nodes to the `users` group):
+
+```bash
+./spi_dump.py --pid 0x2069 13000 64      # device info: serial, VID/PID, colours
+./spi_dump.py --pid 0x2069 130a8 9       # factory primary stick calibration
+./spi_dump.py --pid 0x2073 13140 2       # GameCube trigger zero points
+```
+
+Note: sending only this partial wake (without the full init) can leave a
+controller streaming its fallback report (e.g. the GameCube's `0x05`); a power
+cycle restores the native report.

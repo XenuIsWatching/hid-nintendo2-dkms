@@ -118,8 +118,29 @@
 /* Command-frame fields shared by the LED command and the GameCube rumble report. */
 #define SW2_CMD_SET_LED		0x09
 #define SW2_REQ_TYPE_REQ	0x91
+#define SW2_RSP_TYPE_RSP	0x01
 #define SW2_IFACE_USB		0x00
 #define SW2_SUBCMD_SET_LED	0x07
+
+/*
+ * SPI flash read (vendor command 0x02, subcommand 0x04). Per-unit calibration
+ * for the analog sticks and (GameCube) the analog triggers lives in flash and
+ * is read during probe. Frame: 02 91 00 04 00 08 00 00 <len> 7e 00 00 <addr LE>.
+ */
+#define SW2_CMD_READ_SPI	0x02
+#define SW2_SUBCMD_READ_SPI	0x04
+#define SW2_FLASH_READ_MAX	0x30	/* bytes per read request */
+
+/* Flash addresses (see docs/PROTOCOL.md). */
+#define SW2_FLASH_FACTORY_STICK1	0x130a8	/* left / main stick */
+#define SW2_FLASH_FACTORY_STICK2	0x130e8	/* right / C stick */
+#define SW2_FLASH_FACTORY_TRIGGER	0x13140	/* GameCube L/R zero points */
+#define SW2_FLASH_USER_STICK1		0x1fc040
+#define SW2_FLASH_USER_STICK2		0x1fc080
+#define SW2_STICK_CALIB_LEN		9	/* packed neutral/pos/neg per axis */
+#define SW2_USER_CALIB_LEN		11	/* 2-byte magic + 9-byte calib */
+#define SW2_TRIGGER_CALIB_LEN		2	/* [left_zero, right_zero] */
+#define SW2_USER_CALIB_MAGIC		0xa1b2
 
 /* Player LEDs: vendor command 0x09, subcommand 0x07, bitmask at payload byte. */
 #define SW2_NUM_PLAYER_LEDS	4
@@ -139,22 +160,53 @@
 #define SW2_VIB_FRAME_LEN	5
 #define SW2_RUMBLE_PERIOD_MS	30	/* resend interval while active */
 
-#define SW2_STICK_CENTER	2048	/* 12-bit stick midpoint */
-#define SW2_STICK_MAX		4095
 /*
- * GameCube analog triggers (report bytes 13/14, L/R). Measured on one unit:
- * released rests at ~0x1f-0x21, fully pulled ~0xea. Keep headroom at the top
- * (0xf0) for unit-to-unit variance; values clamp, so a slightly-higher unit
- * still reaches 255 and a released trigger (below MIN) clamps to 0.
+ * Sticks are reported as calibrated signed values (evdev convention). The raw
+ * report carries 12-bit axes; per-unit factory calibration (neutral/positive/
+ * negative span) from flash maps them onto this range. SW2_STICK_CENTER is the
+ * fallback midpoint used only when calibration is absent.
  */
+#define SW2_STICK_CENTER	2048
+#define SW2_STICK_AXIS_MIN	(-32768)
+#define SW2_STICK_AXIS_MAX	32767
+
+/*
+ * GameCube analog triggers (report bytes 13/14, L/R), scaled to
+ * 0..SW2_TRIGGER_RANGE. The per-unit released "zero" point comes from flash
+ * (SW2_FLASH_FACTORY_TRIGGER); the fully-pulled value is NOT stored and varies
+ * by unit, so the full-scale point is auto-calibrated at runtime (the highest
+ * raw value seen, grow-only) starting from SW2_TRIGGER_RAW_FULL as an initial
+ * estimate. The seed is deliberately below the observed full-pull (~0xe0) so
+ * the grow-only tracker can adapt up to each trigger's true maximum; a seed at
+ * or above a unit's real full-pull would cap that trigger below 100%. Until the
+ * first full pull a trigger may reach 100% slightly early; it self-corrects once
+ * pulled fully. SW2_TRIGGER_RAW_MIN is the fallback zero if flash lacks trigger
+ * calibration.
+ */
+#define SW2_TRIGGER_RANGE	4095
+#define SW2_TRIGGER_RAW_FULL	0xc0	/* initial full-scale seed (auto-grows) */
 #define SW2_TRIGGER_RAW_MIN	0x24
-#define SW2_TRIGGER_RAW_MAX	0xf0
 
 enum sw2_ctlr_type {
 	SW2_CTLR_PROCON,
 	SW2_CTLR_JOYCONL,
 	SW2_CTLR_JOYCONR,
 	SW2_CTLR_NSOGC,
+};
+
+/*
+ * Per-axis stick calibration: the resting "neutral" reading plus the spans from
+ * neutral to the positive and negative extremes. All zero means uncalibrated.
+ */
+struct sw2_axis_calib {
+	u16 neutral;
+	u16 positive;
+	u16 negative;
+};
+
+struct sw2_stick_calib {
+	struct sw2_axis_calib x;
+	struct sw2_axis_calib y;
 };
 
 struct sw2_ctlr {
@@ -167,6 +219,9 @@ struct sw2_ctlr {
 	unsigned int ep_out;	/* bulk OUT pipe on the vendor interface */
 	unsigned int ep_in;	/* bulk IN pipe on the vendor interface */
 	struct mutex out_mutex;	/* serializes vendor OUT transfers */
+	struct sw2_stick_calib stick_calib[2];	/* [0]=left/main, [1]=right/C */
+	u8 trigger_zero[2];	/* GameCube L/R rest points (0 = uncalibrated) */
+	u8 trigger_max[2];	/* GameCube L/R full-scale, auto-calibrated */
 	struct led_classdev player_leds[SW2_NUM_PLAYER_LEDS];
 	u8 led_mask;		/* current player LED bitmask */
 	int player_id;		/* assigned player number, -1 if none */
@@ -394,12 +449,45 @@ static void sw2_unpack_stick(const u8 *d, u16 *x, u16 *y)
 	*y = get_unaligned_le16(d + 1) >> 4;
 }
 
-static int sw2_remap_trigger(u8 raw)
+/*
+ * Map one raw 12-bit stick axis to the calibrated signed output range using the
+ * per-unit neutral/positive/negative spans. Falls back to a fixed centre/scale
+ * when the controller reports no calibration.
+ */
+static int sw2_calib_axis(const struct sw2_axis_calib *c, u16 raw, bool negate)
 {
-	int v = clamp_t(int, raw, SW2_TRIGGER_RAW_MIN, SW2_TRIGGER_RAW_MAX);
+	int v = raw;
 
-	return (v - SW2_TRIGGER_RAW_MIN) * 255 /
-	       (SW2_TRIGGER_RAW_MAX - SW2_TRIGGER_RAW_MIN);
+	if (c->neutral && c->positive && c->negative) {
+		v = (v - c->neutral) * (SW2_STICK_AXIS_MAX + 1);
+		v /= (v < 0) ? c->negative : c->positive;
+	} else {
+		v = (v - SW2_STICK_CENTER) * 16;
+	}
+	if (negate)
+		v = -v;
+	return clamp(v, SW2_STICK_AXIS_MIN, SW2_STICK_AXIS_MAX);
+}
+
+/*
+ * Map a raw GameCube trigger byte to 0..SW2_TRIGGER_RANGE. The rest point is the
+ * per-unit zero from flash (or a fallback); the full-scale point is tracked at
+ * runtime as the highest raw seen, so it adapts to each unit without assuming a
+ * fixed maximum.
+ */
+static int sw2_remap_trigger(struct sw2_ctlr *ctlr, int idx, u8 raw)
+{
+	int zero = ctlr->trigger_zero[idx] ? : SW2_TRIGGER_RAW_MIN;
+	int v;
+
+	if (raw > ctlr->trigger_max[idx])
+		ctlr->trigger_max[idx] = raw;
+	if (ctlr->trigger_max[idx] <= zero)
+		return 0;
+
+	v = (SW2_TRIGGER_RANGE + 1) * (raw - zero) /
+	    (ctlr->trigger_max[idx] - zero);
+	return clamp(v, 0, SW2_TRIGGER_RANGE);
 }
 
 /*
@@ -458,6 +546,112 @@ out:
 	kfree(txbuf);
 	kfree(rxbuf);
 	return ret;
+}
+
+/*
+ * Read @len bytes (<= SW2_FLASH_READ_MAX) from SPI flash at @addr over the
+ * vendor interface into @out. The reply echoes a 16-byte command header
+ * followed by the data payload.
+ */
+static int sw2_read_flash(struct sw2_ctlr *ctlr, u32 addr, u8 len, u8 *out)
+{
+	u8 *txbuf, *rxbuf;
+	int ret, actual, i;
+
+	if (len > SW2_FLASH_READ_MAX)
+		return -EINVAL;
+
+	txbuf = kzalloc(64, GFP_KERNEL);
+	rxbuf = kzalloc(64, GFP_KERNEL);
+	if (!txbuf || !rxbuf) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	txbuf[0] = SW2_CMD_READ_SPI;
+	txbuf[1] = SW2_REQ_TYPE_REQ;
+	txbuf[2] = SW2_IFACE_USB;
+	txbuf[3] = SW2_SUBCMD_READ_SPI;
+	txbuf[5] = 0x08;
+	txbuf[8] = len;
+	txbuf[9] = 0x7e;
+	put_unaligned_le32(addr, &txbuf[12]);
+
+	mutex_lock(&ctlr->out_mutex);
+	ret = usb_bulk_msg(ctlr->udev, ctlr->ep_out, txbuf, 16, &actual, 1000);
+	if (ret)
+		goto unlock;
+
+	/* The reply may trail stray frames from init; match cmd/type. */
+	for (i = 0; i < 8; i++) {
+		ret = usb_bulk_msg(ctlr->udev, ctlr->ep_in, rxbuf, 64,
+				   &actual, 1000);
+		if (ret)
+			goto unlock;
+		if (actual >= 16 + len && rxbuf[0] == SW2_CMD_READ_SPI &&
+		    rxbuf[1] == SW2_RSP_TYPE_RSP) {
+			memcpy(out, rxbuf + 16, len);
+			ret = 0;
+			goto unlock;
+		}
+	}
+	ret = -EIO;
+unlock:
+	mutex_unlock(&ctlr->out_mutex);
+out:
+	kfree(txbuf);
+	kfree(rxbuf);
+	return ret;
+}
+
+/* Unpack a 9-byte packed stick-calibration blob (neutral/positive/negative). */
+static void sw2_unpack_stick_calib(struct sw2_stick_calib *c, const u8 *d)
+{
+	c->x.neutral  = d[0] | ((d[1] & 0x0f) << 8);
+	c->y.neutral  = (d[1] >> 4) | (d[2] << 4);
+	c->x.positive = d[3] | ((d[4] & 0x0f) << 8);
+	c->y.positive = (d[4] >> 4) | (d[5] << 4);
+	c->x.negative = d[6] | ((d[7] & 0x0f) << 8);
+	c->y.negative = (d[7] >> 4) | (d[8] << 4);
+}
+
+/*
+ * Load per-unit calibration from flash: factory stick calibration (overridden
+ * by user calibration when the magic marker is present) and, for the GameCube,
+ * the analog-trigger zero points. Best-effort: on any read failure the relevant
+ * calibration simply stays at its uncalibrated default.
+ */
+static void sw2_read_calibration(struct sw2_ctlr *ctlr)
+{
+	u8 buf[SW2_USER_CALIB_LEN];
+
+	if (!sw2_read_flash(ctlr, SW2_FLASH_FACTORY_STICK1,
+			    SW2_STICK_CALIB_LEN, buf))
+		sw2_unpack_stick_calib(&ctlr->stick_calib[0], buf);
+
+	if (!sw2_read_flash(ctlr, SW2_FLASH_USER_STICK1,
+			    SW2_USER_CALIB_LEN, buf) &&
+	    get_unaligned_le16(buf) == SW2_USER_CALIB_MAGIC)
+		sw2_unpack_stick_calib(&ctlr->stick_calib[0], buf + 2);
+
+	if (ctlr->info->has_right_stick) {
+		if (!sw2_read_flash(ctlr, SW2_FLASH_FACTORY_STICK2,
+				    SW2_STICK_CALIB_LEN, buf))
+			sw2_unpack_stick_calib(&ctlr->stick_calib[1], buf);
+
+		if (!sw2_read_flash(ctlr, SW2_FLASH_USER_STICK2,
+				    SW2_USER_CALIB_LEN, buf) &&
+		    get_unaligned_le16(buf) == SW2_USER_CALIB_MAGIC)
+			sw2_unpack_stick_calib(&ctlr->stick_calib[1], buf + 2);
+	}
+
+	if (ctlr->info->has_triggers &&
+	    !sw2_read_flash(ctlr, SW2_FLASH_FACTORY_TRIGGER,
+			    SW2_TRIGGER_CALIB_LEN, buf) &&
+	    buf[0] != 0xff && buf[1] != 0xff) {
+		ctlr->trigger_zero[0] = buf[0];
+		ctlr->trigger_zero[1] = buf[1];
+	}
 }
 
 /* Set the four player-indicator LEDs from a bitmask (bit 0 = LED 1). */
@@ -653,16 +847,17 @@ static void sw2_report_buttons(struct sw2_ctlr *ctlr, const u8 *data)
 
 static void sw2_report_sticks(struct sw2_ctlr *ctlr, const u8 *data)
 {
+	const struct sw2_stick_calib *c = ctlr->stick_calib;
 	u16 x, y;
 
 	sw2_unpack_stick(&data[SW2_OFF_STICK_L], &x, &y);
-	input_report_abs(ctlr->input, ABS_X, x);
-	input_report_abs(ctlr->input, ABS_Y, SW2_STICK_MAX - y);
+	input_report_abs(ctlr->input, ABS_X, sw2_calib_axis(&c[0].x, x, false));
+	input_report_abs(ctlr->input, ABS_Y, sw2_calib_axis(&c[0].y, y, true));
 
 	if (ctlr->info->has_right_stick) {
 		sw2_unpack_stick(&data[SW2_OFF_STICK_R], &x, &y);
-		input_report_abs(ctlr->input, ABS_RX, x);
-		input_report_abs(ctlr->input, ABS_RY, SW2_STICK_MAX - y);
+		input_report_abs(ctlr->input, ABS_RX, sw2_calib_axis(&c[1].x, x, false));
+		input_report_abs(ctlr->input, ABS_RY, sw2_calib_axis(&c[1].y, y, true));
 	}
 }
 
@@ -713,9 +908,9 @@ static int sw2_hid_event(struct hid_device *hdev, struct hid_report *report,
 
 	if (ctlr->info->has_triggers) {
 		input_report_abs(ctlr->input, ABS_Z,
-				 sw2_remap_trigger(data[SW2_OFF_TRIGGER_L]));
+				 sw2_remap_trigger(ctlr, 0, data[SW2_OFF_TRIGGER_L]));
 		input_report_abs(ctlr->input, ABS_RZ,
-				 sw2_remap_trigger(data[SW2_OFF_TRIGGER_R]));
+				 sw2_remap_trigger(ctlr, 1, data[SW2_OFF_TRIGGER_R]));
 	}
 
 	input_sync(ctlr->input);
@@ -748,15 +943,15 @@ static int sw2_input_create(struct sw2_ctlr *ctlr)
 	for (; map->code; map++)
 		input_set_capability(input, EV_KEY, map->code);
 
-	input_set_abs_params(input, ABS_X, 0, SW2_STICK_MAX, 16, 128);
-	input_set_abs_params(input, ABS_Y, 0, SW2_STICK_MAX, 16, 128);
+	input_set_abs_params(input, ABS_X, SW2_STICK_AXIS_MIN, SW2_STICK_AXIS_MAX, 32, 128);
+	input_set_abs_params(input, ABS_Y, SW2_STICK_AXIS_MIN, SW2_STICK_AXIS_MAX, 32, 128);
 	if (ctlr->info->has_right_stick) {
-		input_set_abs_params(input, ABS_RX, 0, SW2_STICK_MAX, 16, 128);
-		input_set_abs_params(input, ABS_RY, 0, SW2_STICK_MAX, 16, 128);
+		input_set_abs_params(input, ABS_RX, SW2_STICK_AXIS_MIN, SW2_STICK_AXIS_MAX, 32, 128);
+		input_set_abs_params(input, ABS_RY, SW2_STICK_AXIS_MIN, SW2_STICK_AXIS_MAX, 32, 128);
 	}
 	if (ctlr->info->has_triggers) {
-		input_set_abs_params(input, ABS_Z, 0, 255, 0, 0);
-		input_set_abs_params(input, ABS_RZ, 0, 255, 0, 0);
+		input_set_abs_params(input, ABS_Z, 0, SW2_TRIGGER_RANGE, 32, 128);
+		input_set_abs_params(input, ABS_RZ, 0, SW2_TRIGGER_RANGE, 32, 128);
 	}
 
 	input_set_capability(input, EV_FF, FF_RUMBLE);
@@ -828,6 +1023,8 @@ static int sw2_hid_probe(struct hid_device *hdev,
 	ctlr->hdev = hdev;
 	ctlr->udev = interface_to_usbdev(to_usb_interface(hdev->dev.parent));
 	ctlr->player_id = -1;
+	ctlr->trigger_max[0] = SW2_TRIGGER_RAW_FULL;
+	ctlr->trigger_max[1] = SW2_TRIGGER_RAW_FULL;
 	mutex_init(&ctlr->out_mutex);
 	ctlr->type = sw2_type_from_product(id->product);
 	ctlr->info = &sw2_ctlr_infos[ctlr->type];
@@ -856,6 +1053,8 @@ static int sw2_hid_probe(struct hid_device *hdev,
 	ret = sw2_send_init(ctlr);
 	if (ret)
 		goto err_close;
+
+	sw2_read_calibration(ctlr);
 
 	ret = sw2_input_create(ctlr);
 	if (ret)
