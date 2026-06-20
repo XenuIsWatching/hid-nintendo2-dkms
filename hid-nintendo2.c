@@ -645,12 +645,18 @@ static void sw2_read_calibration(struct sw2_ctlr *ctlr)
 			sw2_unpack_stick_calib(&ctlr->stick_calib[1], buf + 2);
 	}
 
+	/*
+	 * Trigger zero points. Flash stores them as [right, left], whereas
+	 * trigger_zero is indexed [left, right] to match report bytes 13/14
+	 * (verified on hardware: the left trigger rests at buf[1], the right at
+	 * buf[0]).
+	 */
 	if (ctlr->info->has_triggers &&
 	    !sw2_read_flash(ctlr, SW2_FLASH_FACTORY_TRIGGER,
 			    SW2_TRIGGER_CALIB_LEN, buf) &&
 	    buf[0] != 0xff && buf[1] != 0xff) {
-		ctlr->trigger_zero[0] = buf[0];
-		ctlr->trigger_zero[1] = buf[1];
+		ctlr->trigger_zero[0] = buf[1];
+		ctlr->trigger_zero[1] = buf[0];
 	}
 }
 

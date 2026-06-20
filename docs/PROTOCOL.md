@@ -207,11 +207,13 @@ all `0xff` when unset). Apply: `out = (raw − neutral) * 32768 / span`, choosin
 the positive or negative span by sign; the Y axis is negated. Single-stick
 controllers (Joy-Cons) use the primary slot only.
 
-**GameCube triggers** — 2 bytes at `0x13140` = `[left_zero, right_zero]`, the
-per-unit released rest points (`0xff` = unset). The full-pull value is **not**
-stored and varies by unit (~0xe0), so the driver tracks each trigger's observed
-maximum at runtime (grow-only, seeded below the typical full-pull) and scales
-`out = 4096 * (raw − zero) / (max − zero)` to 0..4095.
+**GameCube triggers** — 2 bytes at `0x13140` = `[right_zero, left_zero]`, the
+per-unit released rest points (`0xff` = unset). Note the order is right-then-left
+(verified on hardware: the left trigger, report byte 13, rests at the *second*
+byte). No full-pull value is stored anywhere in the calibration region — only the
+rest points — and the full-pull (~0xee–0xf0) varies by unit, so the driver tracks
+each trigger's observed maximum at runtime (grow-only, seeded below the typical
+full-pull) and scales `out = 4096 * (raw − zero) / (max − zero)` to 0..4095.
 
 ### IMU (accelerometer; gyro NOT decoded)
 
